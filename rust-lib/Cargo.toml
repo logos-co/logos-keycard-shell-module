@@ -1,0 +1,50 @@
+[package]
+name = "keycard_shell_module"
+version = "0.1.0"
+edition = "2021"
+description = "Logos signer module for the Keycard Shell over USB: its accounts, and requests signed on its own screen."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/logos-co/logos-keycard-shell-module"
+# The module builder's rustc; resolver 3 keeps the lock within it.
+rust-version = "1.89"
+
+[workspace]
+resolver = "3"
+
+[lib]
+# staticlib for the Qt plugin; rlib so cargo test builds the core without the Logos runtime.
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "keycard-shell-emulator"
+path = "src/bin/emulator.rs"
+required-features = ["emulator"]
+
+[dependencies]
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "0c927c3326ac2774dff68f1a4b1a6dd0503949e0" }
+# PSBTs, BIP32 keys and secp256k1. The plugin's export list keeps libsecp256k1 in.
+bitcoin = { version = "0.32.102", default-features = false, features = ["std", "base64"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+sha3 = "0.10"
+# USB HID: the pure-Rust backends on Linux and Windows, IOKit on macOS.
+hidapi = { version = "2.6", default-features = false, features = ["linux-native-basic-udev", "windows-native"], optional = true }
+
+# The emulator's own: BIP39 seeds, recoverable signatures and EIP-712 hashing.
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], optional = true }
+sha2 = { version = "0.10", optional = true }
+alloy = { version = "1", default-features = false, features = ["std", "dyn-abi", "eip712"], optional = true }
+
+# Staged by the builder as a sibling crate; optional so cargo test builds the core without it.
+logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
+
+[dev-dependencies]
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "0c927c3326ac2774dff68f1a4b1a6dd0503949e0", features = ["mock", "conformance"] }
+
+[features]
+default = ["logos_module", "hid"]
+logos_module = ["dep:logos-rust-sdk"]
+hid = ["dep:hidapi"]
+# A Shell in software, for tests and doctests; never in the module.
+emulator = ["dep:pbkdf2", "dep:sha2", "dep:alloy", "bitcoin/secp-recovery"]

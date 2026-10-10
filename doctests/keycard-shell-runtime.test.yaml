@@ -1,0 +1,205 @@
+name: "Signing on a Keycard Shell"
+output: keycard-shell-runtime.md
+release: ""
+
+intro: |
+  `keycard_shell_module` is the Keycard Shell behind the signer interface, over USB. The person
+  offers accounts from the Shell, the signer manager lists them, and each request is shown and
+  confirmed on the Shell's own screen. The module holds no secret: the keys stay on the card inside
+  the Shell.
+
+  This doc-test runs headless through `logoscore`, against `keycard-shell-emulator`: a Shell in
+  software that answers the firmware's USB commands over the same frames, from the
+  "abandon … about" test phrase, and confirms every request at once. A real Shell asks its person.
+
+what_you_build: "The Keycard Shell module, the signer manager and an emulated Shell, driven through a `logoscore` daemon."
+
+what_you_learn:
+  - How accounts are offered from a Shell, each key confirmed on it
+  - How the signer manager hands the Shell the whole request, and checks what comes back
+  - Why the module keeps public material only
+
+prerequisites:
+  - "**Nix** with flakes enabled."
+  - "**A Linux or macOS machine.** Everything here is offline, and no Shell is needed."
+
+sections:
+  - title: "Build logoscore and lgpm"
+    step: true
+    steps:
+      - title: "Build logoscore"
+        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos"
+        check_file: "logos/bin/logoscore"
+      - title: "Build lgpm"
+        run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
+        check_file: "lgpm/bin/lgpm"
+
+  - title: "Build and install the modules"
+    step: true
+    text: |
+      The manager is pinned to the commit that hands a device with a screen the whole request. Its
+      doc-test probe plays the requester and the approver, as the wallet and the signer app do.
+    steps:
+      - title: "Build the Shell module, the emulator, the manager and its probe"
+        run: |
+          nix build 'github:logos-co/logos-keycard-shell-module{release}#lgx' --no-write-lock-file -o shell-lgx
+          nix build 'github:logos-co/logos-keycard-shell-module{release}#emulator' --no-write-lock-file -o emulator
+          nix build 'github:logos-co/logos-evm-keystore-module/e4c6fcd39411f0ed52083f0a7fb2701e742f81f1#lgx' --no-write-lock-file -o keystore-lgx
+          nix build 'github:logos-co/logos-signer-manager-module/69ea9439bd29d62ce69bfa836f4acf854facba14#lgx' --no-write-lock-file -o manager-lgx
+          nix build 'github:logos-co/logos-signer-manager-module/69ea9439bd29d62ce69bfa836f4acf854facba14?dir=doctests/manager-probe#lgx' --override-input signer_manager_module 'github:logos-co/logos-signer-manager-module/69ea9439bd29d62ce69bfa836f4acf854facba14' --override-input keystore_module 'github:logos-co/logos-evm-keystore-module/e4c6fcd39411f0ed52083f0a7fb2701e742f81f1' --no-write-lock-file -o probe-lgx
+          ls shell-lgx/*.lgx emulator/bin/
+        code_block: |
+          nix build '.#lgx' -o shell-lgx
+          nix build '.#emulator' -o emulator      # a Shell in software, for tests
+        expect_contains:
+          - "keycard-shell-emulator"
+      - title: "Install them"
+        run: |
+          mkdir -p modules
+          cp -RL ./logos/modules/. ./modules/
+          chmod -R u+w modules
+          for p in shell keystore manager probe; do ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file $p-lgx/*.lgx; done
+          ./lgpm/bin/lgpm --modules-dir ./modules list
+        code_block: "lgpm --modules-dir ./modules --allow-unsigned install --file shell-lgx/*.lgx"
+        expect_contains:
+          - "keycard_shell_module"
+          - "signer_manager_module"
+          - "manager_probe"
+
+  - title: "An emulated Shell, and the daemon"
+    step: true
+    steps:
+      - title: "Start the emulated Shell"
+        run: "sh -c './emulator/bin/keycard-shell-emulator > shell.addr 2> shell.log & echo $! > shell.pid'; sleep 1; cat shell.addr"
+        code_block: "keycard-shell-emulator > shell.addr &        # prints 127.0.0.1:<port>"
+        expect_contains:
+          - "127.0.0.1:"
+      - title: "Start the daemon, pointed at it"
+        text: "Without `KEYCARD_SHELL_EMULATOR`, the module looks for a Shell on USB."
+        run: "sh -c 'KEYCARD_SHELL_EMULATOR=$(cat shell.addr) ./logos/bin/logoscore -D -m ./modules > logs.txt 2>&1 &'"
+        code_block: "KEYCARD_SHELL_EMULATOR=127.0.0.1:<port> logoscore -D -m ./modules > logs.txt &"
+      - run: "sleep 3"
+      - title: "Load the Shell module, and the probe with the manager"
+        run: |
+          ./logos/bin/logoscore load-module keycard_shell_module
+          ./logos/bin/logoscore load-module manager_probe
+        code_block: |
+          logoscore load-module keycard_shell_module
+          logoscore load-module manager_probe
+        expect_contains:
+          - "keycard_shell_module"
+          - "signer_manager_module"
+      - title: "It signs whole requests, on its own screen"
+        run: "./logos/bin/logoscore call keycard_shell_module signer_info"
+        code_block: "logoscore call keycard_shell_module signer_info"
+        expect_contains:
+          - '\"kind\":\"keycard_shell\"'
+          - '\"showsRequest\":true'
+          - '\"collects\":\"nothing\"'
+          - "evm_transaction"
+          - "btc_psbt"
+      - title: "The Shell is connected"
+        run: "./logos/bin/logoscore call keycard_shell_module devices"
+        code_block: "logoscore call keycard_shell_module devices"
+        expect_contains:
+          - '\"firmware\":\"1.4.0\"'
+
+  - title: "Offer its accounts"
+    step: true
+    text: |
+      The Shell's app asks for the accounts the person chooses. Each key is exported only once the
+      person confirms it on the Shell, and a Bitcoin account's parent key too, for the fingerprint
+      its xpub carries. The module keeps their public material and the Shell's serial, nothing else.
+    steps:
+      - title: "An EVM, a native segwit and a taproot account"
+        run: |
+          ./logos/bin/logoscore call keycard_shell_module add_accounts '{"families":["evm","bitcoin","bitcoin_taproot"],"chain":"test"}' > add.json
+          job=$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' add.json job)
+          for i in $(seq 1 40); do ./logos/bin/logoscore call keycard_shell_module add_status "$job" > added.json; grep -Eq 'state.....(done|failed)' added.json && break; sleep 0.5; done
+          cat added.json
+        code_block: |
+          logoscore call keycard_shell_module add_accounts '{"families":["evm","bitcoin","bitcoin_taproot"],"chain":"test"}'
+          logoscore call keycard_shell_module add_status <job>     # done, once confirmed on the Shell
+        expect_contains:
+          - '\"state\":\"done\"'
+          - "0x9858effd232b4033e47d90003d41ec34ecaeda94"
+          - "shell-73c5da0a-84-1-0"
+          - "shell-73c5da0a-86-1-0"
+      - title: "The manager lists them under the Shell"
+        run: |
+          ./logos/bin/logoscore call signer_manager_module configure '{"approvers":"manager_probe","custodians":"manager_probe","signers":["keycard_shell_module"]}'
+          ./logos/bin/logoscore call signer_manager_module accounts
+        code_block: |
+          logoscore call signer_manager_module configure '{…, "signers":["keycard_shell_module"]}'
+          logoscore call signer_manager_module accounts
+        expect_contains:
+          - '\"signer\":\"keycard_shell_module\"'
+          - "0x9858effd232b4033e47d90003d41ec34ecaeda94"
+
+  - title: "Requests signed on the Shell"
+    step: true
+    text: |
+      The manager hands the Shell the message or the transaction itself, never a hash, and reports
+      `signing` while the person reads it on the Shell. When the Shell answers, the manager checks
+      the signature against the account before the requester can collect anything.
+    steps:
+      - title: "A message"
+        run: |
+          ./logos/bin/logoscore call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a Shell","legs":[{"kind":"message","text":"signed on the Shell"}]}' > mreq.json
+          python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' mreq.json handle > mhandle; python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' mreq.json receipt > mreceipt
+          ./logos/bin/logoscore call manager_probe acknowledge "$(cat mhandle)" > mshown.json
+          cat mshown.json
+          ./logos/bin/logoscore call manager_probe approve "$(cat mhandle)" "$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' mshown.json bundle_id)" ""
+          for i in $(seq 1 40); do ./logos/bin/logoscore call manager_probe status "$(cat mhandle)" "$(cat mreceipt)" > mstatus.json; grep -q 'settled' mstatus.json && break; sleep 0.5; done
+          cat mstatus.json
+          ./logos/bin/logoscore call manager_probe fetch "$(cat mhandle)" "$(cat mreceipt)"
+        code_block: |
+          logoscore call manager_probe request '{"address":"0x9858…aEda94","legs":[{"kind":"message","text":"signed on the Shell"}]}'
+          logoscore call manager_probe approve <handle> <bundle_id> ""   # signing: the Shell shows it
+          logoscore call manager_probe fetch <handle> <receipt>
+        expect_contains:
+          - '\"collects\":\"nothing\"'
+          - '\"signer\":\"keycard_shell_module\"'
+          - '\"reason\":\"approved\"'
+          - '\"signed\":[\"0x'
+      - title: "A Sepolia transaction"
+        run: |
+          ./logos/bin/logoscore call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a Shell","legs":[{"kind":"tx","chain_id":11155111,"tx":{"to":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","value":"0x1","nonce":"0x0","gas_limit":"0x5208","fee_mode":"eip1559","max_fee_per_gas":"0x3b9aca00","max_priority_fee_per_gas":"0x1"}}]}' > treq.json
+          python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' treq.json handle > thandle; python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' treq.json receipt > treceipt
+          ./logos/bin/logoscore call manager_probe acknowledge "$(cat thandle)" > tshown.json
+          ./logos/bin/logoscore call manager_probe approve "$(cat thandle)" "$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' tshown.json bundle_id)" ""
+          for i in $(seq 1 40); do ./logos/bin/logoscore call manager_probe status "$(cat thandle)" "$(cat treceipt)" > tstatus.json; grep -q 'settled' tstatus.json && break; sleep 0.5; done
+          cat tstatus.json
+          ./logos/bin/logoscore call manager_probe fetch "$(cat thandle)" "$(cat treceipt)"
+        code_block: "logoscore call manager_probe request '{…, \"legs\":[{\"kind\":\"tx\",\"chain_id\":11155111, …}]}'"
+        expect_contains:
+          - '\"reason\":\"approved\"'
+          - '\"signed\":[\"0x02'
+
+  - title: "Take an account away"
+    step: true
+    steps:
+      - title: "The taproot account is no longer offered"
+        text: "Nothing on the Shell changes; it can be offered again."
+        run: |
+          ./logos/bin/logoscore call keycard_shell_module remove_account shell-73c5da0a-86-1-0
+          ./logos/bin/logoscore call keycard_shell_module signer_accounts
+        code_block: "logoscore call keycard_shell_module remove_account shell-73c5da0a-86-1-0"
+        expect_contains:
+          - '\"removed\":true'
+          - "shell-73c5da0a-84-1-0"
+
+  - title: "Stop"
+    step: true
+    steps:
+      - title: "Stop the daemon"
+        run: "./logos/bin/logoscore stop"
+        code_block: "logoscore stop"
+      - title: "Stop the emulated Shell"
+        run: "kill $(cat shell.pid)"
+      - run: "sleep 2"
+      - title: "Confirm the daemon has stopped"
+        run: "./logos/bin/logoscore status || true"
+        code_block: "logoscore status"
+        expect_contains:
+          - '"status":"not_running"'
