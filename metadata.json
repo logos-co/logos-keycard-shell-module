@@ -1,0 +1,22 @@
+{
+  "name": "keycard_shell_module",
+  "version": "0.1.0",
+  "description": "Keycard Shell signer: the accounts the person offered from a Keycard Shell over USB, and each request signed on the Shell's own screen. Holds no secret.",
+  "author": "Logos Core Team",
+  "type": "core",
+  "interface": "cdylib",
+  "concurrency": "multi",
+  "category": "wallet",
+  "main": "keycard_shell_module_plugin",
+  "dependencies": [],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "rust": { "crate": "rust-lib", "trait": "KeycardShellModule", "source": "src/glue.rs" }
+  },
+  "nix": {
+    "external_libraries": [],
+    "packages": { "build": [], "runtime": [] },
+    "cmake": { "find_packages": [], "extra_include_dirs": [] }
+  }
+}
