@@ -2,11 +2,13 @@
 //! request ends. Every signature is checked with the manager's own check, over a digest worked
 //! out here.
 
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use keycard_shell_module::apdu::{self, Transport};
+use keycard_shell_module::apdu::{self, ShellError, Transport};
+use keycard_shell_module::commands;
 use keycard_shell_module::emulator::{Confirm, Emulator, PHRASE};
 use keycard_shell_module::link::{Devices, Emulated};
 use keycard_shell_module::signer::{AddRequest, Quiet, ShellSigner};
@@ -37,6 +39,7 @@ impl Devices for Plug {
 
 struct Rig {
     emu: Emulator,
+    addr: String,
     shell: ShellSigner,
     on: Arc<AtomicBool>,
 }
@@ -46,11 +49,16 @@ fn rig_with(store: Store) -> Rig {
     let addr = emu.listen().unwrap();
     let on = Arc::new(AtomicBool::new(true));
     let devices = Plug {
-        inner: Emulated::new(addr),
+        inner: Emulated::new(addr.clone()),
         on: on.clone(),
     };
     let shell = ShellSigner::new(Box::new(devices), store, Box::new(Quiet));
-    Rig { emu, shell, on }
+    Rig {
+        emu,
+        addr,
+        shell,
+        on,
+    }
 }
 
 /// Press yes for every question the Shell asks until `done` says to stop.
@@ -337,4 +345,67 @@ fn the_emulator_answers_the_shells_device_info() {
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0].serial, rig.emu.serial());
     assert_eq!(devices[0].firmware.as_deref(), Some("1.4.0"));
+}
+
+/// The suite's taproot PSBT at the account's first address, its internal key replaced by `internal`.
+fn taproot_psbt(
+    account: &Account,
+    internal: Option<bitcoin::XOnlyPublicKey>,
+) -> (String, Vec<HashItem>) {
+    let base = account.path.clone().unwrap();
+    let path = format!("{base}/0/0");
+    let (psbt, items) = conformance::psbt_for(account, &[(path.clone(), path)]);
+    let mut p = bitcoin::Psbt::from_str(&psbt).unwrap();
+    p.inputs[0].tap_internal_key = internal;
+    (p.to_string(), items)
+}
+
+#[test]
+fn a_taproot_psbt_without_its_internal_key_has_it_named_and_signs() {
+    let mut rig = rig_with(Store::new());
+    let taproot = add(&rig, vec![Family::BitcoinTaproot], Chain::Test).remove(0);
+    let (psbt, items) = taproot_psbt(&taproot, None);
+    let payload = Payload::BtcPsbt {
+        network: "testnet".into(),
+        psbt,
+    };
+    let sigs = sign(&mut rig, &taproot, payload).unwrap();
+    check(&taproot, &items[0], &sigs[0]).unwrap();
+}
+
+#[test]
+fn a_taproot_psbt_naming_another_internal_key_is_refused_before_the_shell() {
+    let mut rig = rig_with(Store::new());
+    let taproot = add(&rig, vec![Family::BitcoinTaproot], Chain::Test).remove(0);
+    // The generator's x coordinate: a key, but not this account's.
+    let other = bitcoin::XOnlyPublicKey::from_str(
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    )
+    .unwrap();
+    let (psbt, _) = taproot_psbt(&taproot, Some(other));
+    let e = rig
+        .shell
+        .sign(SignRequest {
+            account: taproot.id.clone(),
+            payload: Payload::BtcPsbt {
+                network: "testnet".into(),
+                psbt,
+            },
+            secret: None,
+        })
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{}", e.message);
+}
+
+#[test]
+fn the_emulator_refuses_a_taproot_input_without_its_internal_key_as_the_firmware_does() {
+    let rig = rig_with(Store::new());
+    let taproot = add(&rig, vec![Family::BitcoinTaproot], Chain::Test).remove(0);
+    let (psbt, _) = taproot_psbt(&taproot, None);
+    let bytes = bitcoin::Psbt::from_str(&psbt).unwrap().serialize();
+    let mut t = Emulated::new(rig.addr.clone())
+        .open(&rig.emu.serial())
+        .unwrap();
+    let answer = commands::sign_psbt(&mut *t, &bytes);
+    assert!(matches!(answer, Err(ShellError::InvalidData)), "{answer:?}");
 }

@@ -163,16 +163,21 @@ impl Default for Usb {
 #[cfg(feature = "hid")]
 struct HidFrames(hidapi::HidDevice);
 
+/// A Shell that left USB mid-session: unplugged, or off after its idle time.
+#[cfg(feature = "hid")]
+fn gone(e: hidapi::HidError) -> ShellError {
+    ShellError::Link(format!(
+        "the Keycard Shell disconnected; it turns itself off after a few minutes without a press: turn it on, unlock it and try again ({e})"
+    ))
+}
+
 #[cfg(feature = "hid")]
 impl Frames for HidFrames {
     fn write(&mut self, frame: &[u8; FRAME]) -> Result<()> {
         // Report ID 0 first: the Shell's reports have none.
         let mut report = [0u8; FRAME + 1];
         report[1..].copy_from_slice(frame);
-        self.0
-            .write(&report)
-            .map(|_| ())
-            .map_err(|e| ShellError::Link(e.to_string()))
+        self.0.write(&report).map(|_| ()).map_err(gone)
     }
 
     fn read(&mut self, wait: Duration) -> Result<Option<[u8; FRAME]>> {
@@ -180,7 +185,7 @@ impl Frames for HidFrames {
         let n = self
             .0
             .read_timeout(&mut buf, wait.as_millis() as i32)
-            .map_err(|e| ShellError::Link(e.to_string()))?;
+            .map_err(gone)?;
         Ok((n > 0).then_some(buf))
     }
 }

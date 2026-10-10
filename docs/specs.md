@@ -71,6 +71,10 @@ keys. The manager then refuses its answer, because the signature doesn't recover
   sees it. From the PSBT the Shell returns, the module takes each input's signature by that key: a
   partial signature for native segwit, or the key-path signature for taproot. It names the tweaked
   output key for taproot.
+- **Taproot's internal key.** Firmware 1.4.0 signs a taproot input only once the PSBT names its
+  internal key, which it tweaks by. The module names it where a wallet left it out: for this
+  account's key-path spend, it is the key at the input's own path. An input that names another key,
+  or a script tree, is refused as `invalid` before the Shell sees it.
 
 The answer is signatures only. The manager checks each one against the account over its own digest,
 and builds the signed transaction or PSBT itself.
@@ -85,6 +89,7 @@ request waits until it has.
 | `0x6a80` to a PSBT | `refused`: the firmware answers this both when its person declines and when it can't sign, and its screen says which |
 | `0x6a80` to anything else | `invalid` |
 | `0x6985`, such as no card or a locked one; or no link | `unavailable` |
+| the Shell leaves USB mid-request | `unavailable`, saying to turn it on and unlock it: it turns itself off after three minutes without a press, by default |
 | `0x6501` | `unsupported` |
 
 Taproot needs a card whose applet signs BIP340, applet 4.0 or later.
@@ -124,7 +129,9 @@ declines every one, or waits for a press in tests. `KEYCARD_SHELL_EMULATOR=host:
 module at it instead of USB.
 
 It is written from the firmware's source, not from the device, so it proves the module agrees with
-that reading. A real Shell is the proof that both agree with the device: see below.
+that reading. A real Shell is the proof that both agree with the device: see below. A real Shell on
+1.4.0 showed that this reading had missed the firmware's need for a taproot input's internal key; the
+emulator now refuses such an input as the firmware does.
 
 ## Platforms
 
@@ -138,11 +145,13 @@ that reading. A real Shell is the proof that both agree with the device: see bel
 ## By hand, with a Shell
 
 1. Plug in a Shell with a card set up, unlock it, and start the module without `KEYCARD_SHELL_EMULATOR`.
+   Taproot needs a 4.0 card. A card whose identity Keycard didn't sign first shows the Shell's own
+   "not genuine" warning, which the person accepts on the Shell.
 2. `devices` lists it with its firmware.
 3. `add_accounts` with every family. Confirm each export on the Shell, twice for each Bitcoin
    account. The EVM address and the first receive address should match what the Shell shows for
    that account.
-4. Have the manager list `keycard_shell_module` as a signer. Send a regtest PSBT and an Anvil EVM
+4. The manager consults `keycard_shell_module` by default. Send a regtest PSBT and an Anvil EVM
    transaction through it. Each shows on the Shell, and once confirmed there, the manager settles it
    `approved`.
 5. Decline one on the Shell: the request settles `rejected`.
