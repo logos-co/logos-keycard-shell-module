@@ -194,9 +194,12 @@ impl Work {
                     .ok_or_else(|| invalid("account fingerprint".into()))?;
                 let base = parse_path(account.path.as_deref().unwrap_or_default())
                     .ok_or_else(|| invalid("account path".into()))?;
-                let parsed =
+                let mut parsed =
                     Psbt::from_str(psbt.trim()).map_err(|e| invalid(format!("psbt: {e}")))?;
                 check_inputs(&parsed, account.family, fingerprint, &base)?;
+                if account.family == Family::BitcoinTaproot {
+                    name_internal_keys(&mut parsed, fingerprint)?;
+                }
                 Ok(Work::Psbt {
                     psbt: parsed.serialize(),
                     fingerprint,
@@ -246,6 +249,30 @@ fn check_inputs(
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+/// The Shell's firmware signs a taproot input only once the PSBT names its internal key, which
+/// for this wallet's key-path spend is the key at the input's own path: name it where a wallet left
+/// it out. An input naming another key, or a script tree, is no key-path spend of this account.
+fn name_internal_keys(psbt: &mut Psbt, fingerprint: [u8; 4]) -> Result<(), SignerError> {
+    for (i, input) in psbt.inputs.iter_mut().enumerate() {
+        let Some(key) = input
+            .tap_key_origins
+            .iter()
+            .find(|(_, (_, (fp, _)))| fp.to_bytes() == fingerprint)
+            .map(|(k, _)| *k)
+        else {
+            continue;
+        };
+        if input.tap_merkle_root.is_some() || input.tap_internal_key.is_some_and(|k| k != key) {
+            return Err(err(
+                ErrorCode::Invalid,
+                format!("input {i}: not a key-path spend of this account"),
+            ));
+        }
+        input.tap_internal_key = Some(key);
     }
     Ok(())
 }

@@ -408,6 +408,10 @@ impl Emulator {
                 sigs.push((i, Some((key, sig)), None));
                 signed += 1;
             } else if let Some(path) = input.tap_key_origins.values().find_map(|(_, s)| mine(s)) {
+                // As firmware 1.4.0: no internal key, no signature; the tweak is the internal key's.
+                let Some(internal) = input.tap_internal_key else {
+                    return sw(0x6a80);
+                };
                 let Ok(h) = cache.taproot_key_spend_signature_hash(
                     i,
                     &Prevouts::All(&prevouts),
@@ -421,7 +425,11 @@ impl Emulator {
                     .derive_priv(&self.secp, &path)
                     .expect("key")
                     .private_key;
-                let tweaked = Keypair::from_secret_key(&self.secp, &sk).tap_tweak(&self.secp, None);
+                let keypair = Keypair::from_secret_key(&self.secp, &sk);
+                if keypair.x_only_public_key().0 != internal {
+                    return sw(0x6a80);
+                }
+                let tweaked = keypair.tap_tweak(&self.secp, input.tap_merkle_root);
                 let sig = self.secp.sign_schnorr_no_aux_rand(
                     &Message::from_digest(h.to_byte_array()),
                     &tweaked.to_keypair(),
