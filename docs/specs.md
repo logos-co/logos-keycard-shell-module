@@ -111,6 +111,12 @@ For the Shell's app:
 - `add_accounts`: takes `{ families, chain?, account?, label?, serial? }` and returns `{ ok, job }`. `chain` is `main` or `test`, the default `test`. `account` defaults to 0.
 - `add_status`: an export's progress, `{ ok, job, state, accounts?, error? }`. The state is `confirm_on_device`, `done` or `failed`.
 - `remove_account`: stop offering an account, `{ ok, removed }`.
+- `rename_account`: `(id, name)` → `{ ok }`, a local label; an empty name restores the default.
+- `wallet_groups`: the saved wallets, one per `seed:<keyUid>` (or a legacy group until it is
+  identified), with their accounts, aliases and connections: `{ ok, groups }`.
+- `rename_wallet`: `(id, name)` → `{ ok }`; at most 80 characters, no control characters.
+- `forget_wallet`: `(id)` → `{ ok }`, removing the wallet's saved accounts, name, aliases and
+  connections. Nothing on the Shell changes.
 
 Who may call which comes from module identity in the new core.
 
