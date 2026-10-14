@@ -103,7 +103,10 @@ pub trait Devices: Send + Sync {
     /// Enumeration identity for this attachment, distinct from the persistent USB serial.
     /// Backends without an attachment ID rely on observing absence between connections.
     fn connections(&self) -> Vec<(String, String)> {
-        self.connected().into_iter().map(|serial| (serial.clone(), serial)).collect()
+        self.connected()
+            .into_iter()
+            .map(|serial| (serial.clone(), serial))
+            .collect()
     }
     /// Open the exact attachment that was enumerated, not a replacement with the same serial.
     fn open_connection(&self, serial: &str, _token: &str) -> Result<Box<dyn Transport>> {
@@ -202,21 +205,33 @@ impl Frames for HidFrames {
 #[cfg(feature = "hid")]
 impl Devices for Usb {
     fn connected(&self) -> Vec<String> {
-        self.connections().into_iter().map(|(serial, _)| serial).collect()
+        self.connections()
+            .into_iter()
+            .map(|(serial, _)| serial)
+            .collect()
     }
 
     fn connections(&self) -> Vec<(String, String)> {
         self.with_api(|api| {
-            api.refresh_devices().map_err(|e| ShellError::Link(format!("USB: {e}")))?;
-            Ok(api.device_list()
+            api.refresh_devices()
+                .map_err(|e| ShellError::Link(format!("USB: {e}")))?;
+            Ok(api
+                .device_list()
                 .filter(|d| d.vendor_id() == VENDOR_ID && d.product_id() == PRODUCT_ID)
                 // macOS HID paths contain the IORegistry service entry ID, so even a
                 // reconnect between polls creates a new token. Other platforms also
                 // invalidate on a changed path or an observed removal/link failure.
-                .filter_map(|d| d.serial_number().map(|serial|
-                    (serial.to_lowercase(), d.path().to_string_lossy().into_owned())))
+                .filter_map(|d| {
+                    d.serial_number().map(|serial| {
+                        (
+                            serial.to_lowercase(),
+                            d.path().to_string_lossy().into_owned(),
+                        )
+                    })
+                })
                 .collect())
-        }).unwrap_or_default()
+        })
+        .unwrap_or_default()
     }
 
     fn open_connection(&self, _serial: &str, token: &str) -> Result<Box<dyn Transport>> {

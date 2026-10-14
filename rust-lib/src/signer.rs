@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::Psbt;
-use bitcoin::hashes::{sha256, Hash};
 use logos_signer_interface::jobs::JobTable;
 use logos_signer_interface::{
     Account, Chain, Collects, ErrorCode, Family, JobState, JobStatus, Payload, RequestKind,
@@ -87,7 +87,10 @@ pub struct Device {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database: Option<u32>,
     pub busy: bool,
-    #[serde(rename = "verifiedMasterKeyId", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "verifiedMasterKeyId",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub verified_master_key_id: Option<String>,
 }
 
@@ -302,15 +305,27 @@ impl Shared {
         // Serialize enumeration and cache updates so an older poll cannot restore a session.
         let mut sessions = lock(&self.sessions);
         let attachments = self.devices.connections();
-        let mut now: Vec<_> = attachments.iter().map(|(serial, _)| serial.clone()).collect();
-        now.sort(); now.dedup();
+        let mut now: Vec<_> = attachments
+            .iter()
+            .map(|(serial, _)| serial.clone())
+            .collect();
+        now.sort();
+        now.dedup();
         let before = sessions.len();
-        sessions.retain(|serial, session| attachments.iter().any(|(s, token)| s == serial && token == &session.token));
+        sessions.retain(|serial, session| {
+            attachments
+                .iter()
+                .any(|(s, token)| s == serial && token == &session.token)
+        });
         let mut changed = sessions.len() != before;
         for (serial, token) in attachments {
             sessions.entry(serial).or_insert_with(|| {
                 changed = true;
-                ConnectionSession { token, epoch: self.seq.fetch_add(1, Ordering::SeqCst), root: None }
+                ConnectionSession {
+                    token,
+                    epoch: self.seq.fetch_add(1, Ordering::SeqCst),
+                    root: None,
+                }
             });
         }
         *lock(&self.connected) = now.clone();
@@ -321,33 +336,69 @@ impl Shared {
         }
     }
 
-    fn open_session(&self, serial: &str) -> Result<(Box<dyn crate::apdu::Transport>, u64), SignerError> {
-        let (token, epoch) = lock(&self.sessions).get(serial)
+    fn open_session(
+        &self,
+        serial: &str,
+    ) -> Result<(Box<dyn crate::apdu::Transport>, u64), SignerError> {
+        let (token, epoch) = lock(&self.sessions)
+            .get(serial)
             .map(|s| (s.token.clone(), s.epoch))
-            .ok_or_else(|| err(ErrorCode::Unavailable, "The Shell disconnected. Reconnect it and retry."))?;
-        let t = self.devices.open_connection(serial, &token)
+            .ok_or_else(|| {
+                err(
+                    ErrorCode::Unavailable,
+                    "The Shell disconnected. Reconnect it and retry.",
+                )
+            })?;
+        let t = self
+            .devices
+            .open_connection(serial, &token)
             .map_err(|e| self.connection_error(serial, epoch, e, false))?;
         Ok((t, epoch))
     }
 
-    fn connection_error(&self, serial: &str, epoch: u64, error: ShellError, psbt: bool) -> SignerError {
+    fn connection_error(
+        &self,
+        serial: &str,
+        epoch: u64,
+        error: ShellError,
+        psbt: bool,
+    ) -> SignerError {
         if matches!(&error, ShellError::Link(_) | ShellError::Conditions) {
-            if let Some(session) = lock(&self.sessions).get_mut(serial).filter(|s| s.epoch == epoch) {
+            if let Some(session) = lock(&self.sessions)
+                .get_mut(serial)
+                .filter(|s| s.epoch == epoch)
+            {
                 session.root = None;
             }
         }
         shell_error(error, psbt)
     }
 
-    fn verified_root(&self, serial: &str, epoch: u64, t: &mut dyn crate::apdu::Transport) -> Result<commands::Exported, SignerError> {
-        if let Some(root) = lock(&self.sessions).get(serial).filter(|s| s.epoch == epoch).and_then(|s| s.root.clone()) {
+    fn verified_root(
+        &self,
+        serial: &str,
+        epoch: u64,
+        t: &mut dyn crate::apdu::Transport,
+    ) -> Result<commands::Exported, SignerError> {
+        if let Some(root) = lock(&self.sessions)
+            .get(serial)
+            .filter(|s| s.epoch == epoch)
+            .and_then(|s| s.root.clone())
+        {
             return Ok(root);
         }
         let root = commands::get_public(t, &[], false)
             .map_err(|e| self.connection_error(serial, epoch, e, false))?;
         let mut sessions = lock(&self.sessions);
-        let session = sessions.get_mut(serial).filter(|s| s.epoch == epoch)
-            .ok_or_else(|| err(ErrorCode::Unavailable, "The USB connection changed during verification. Retry."))?;
+        let session = sessions
+            .get_mut(serial)
+            .filter(|s| s.epoch == epoch)
+            .ok_or_else(|| {
+                err(
+                    ErrorCode::Unavailable,
+                    "The USB connection changed during verification. Retry.",
+                )
+            })?;
         session.root = Some(root.clone());
         drop(sessions);
         self.events.accounts_changed(lock(&self.store).list().len());
@@ -360,23 +411,44 @@ impl Shared {
         candidates.sort_by_key(|serial| serial != &offered.serial);
         let mut available = None;
         for serial in candidates {
-            if lock(&self.jobs).status(job).is_ok_and(|s| s.state == JobState::Cancelled) {
+            if lock(&self.jobs)
+                .status(job)
+                .is_ok_and(|s| s.state == JobState::Cancelled)
+            {
                 return Err(err(ErrorCode::Refused, "Request cancelled"));
             }
-            if offered.master_key_id.is_empty() && serial != offered.serial { continue; }
-            let (mut t, epoch) = match self.open_session(&serial) { Ok(t) => t, Err(_) => continue };
+            if offered.master_key_id.is_empty() && serial != offered.serial {
+                continue;
+            }
+            let (mut t, epoch) = match self.open_session(&serial) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
             let root = self.verified_root(&serial, epoch, &mut *t)?;
             if offered.master_key_id.is_empty() {
-                return Err(err(ErrorCode::Invalid, "Identify this wallet before signing."));
+                return Err(err(
+                    ErrorCode::Invalid,
+                    "Identify this wallet before signing.",
+                ));
             }
-            if master_id(&root.key) != offered.master_key_id { continue; }
-            available = Some((t, serial, epoch)); break;
+            if master_id(&root.key) != offered.master_key_id {
+                continue;
+            }
+            available = Some((t, serial, epoch));
+            break;
         }
-        let (mut transport, serial, epoch) = available.ok_or_else(|| err(ErrorCode::Unavailable,
-            "No connected Shell has this wallet's seed. Insert its Keycard and retry."))?;
+        let (mut transport, serial, epoch) = available.ok_or_else(|| {
+            err(
+                ErrorCode::Unavailable,
+                "No connected Shell has this wallet's seed. Insert its Keycard and retry.",
+            )
+        })?;
         let shell = |e| self.connection_error(&serial, epoch, e, psbt);
         let t = &mut *transport;
-        if lock(&self.jobs).status(job).is_ok_and(|s| s.state == JobState::Cancelled) {
+        if lock(&self.jobs)
+            .status(job)
+            .is_ok_and(|s| s.state == JobState::Cancelled)
+        {
             return Err(err(ErrorCode::Refused, "Request cancelled"));
         }
         let evm = |a: commands::Vrs, base, key: &PublicKey| {
@@ -414,26 +486,45 @@ impl Shared {
         }
     }
 
-    fn export(&self, serial: &str, req: &AddRequest) -> Result<(Vec<Offered>, String), SignerError> {
+    fn export(
+        &self,
+        serial: &str,
+        req: &AddRequest,
+    ) -> Result<(Vec<Offered>, String), SignerError> {
         let (mut t, epoch) = self.open_session(serial)?;
         let shell = |e| self.connection_error(serial, epoch, e, false);
         let t = &mut *t;
         let root = self.verified_root(serial, epoch, t)?;
         let root_id = master_id(&root.key);
         if req.master_key_id.as_ref().is_some_and(|id| id != &root_id) {
-            return Err(err(ErrorCode::Invalid, "The Shell contains a different wallet. Open the selected wallet and retry."));
+            return Err(err(
+                ErrorCode::Invalid,
+                "The Shell contains a different wallet. Open the selected wallet and retry.",
+            ));
         }
-        if req.verify_only { return Ok((Vec::new(), root_id)); }
+        if req.verify_only {
+            return Ok((Vec::new(), root_id));
+        }
         let mut out = Vec::new();
         // A short fingerprint cannot prove that legacy accounts share this root. Re-export
         // each saved key and compare its full public key before associating it with the root.
-        let legacy: Vec<_> = lock(&self.store).list().iter().filter(|o|
-            o.serial == serial && o.master_key_id.is_empty()
-            && o.account.fingerprint.as_deref() == Some(hex::encode(root.fingerprint).as_str())
-        ).cloned().collect();
+        let legacy: Vec<_> = lock(&self.store)
+            .list()
+            .iter()
+            .filter(|o| {
+                o.serial == serial
+                    && o.master_key_id.is_empty()
+                    && o.account.fingerprint.as_deref()
+                        == Some(hex::encode(root.fingerprint).as_str())
+            })
+            .cloned()
+            .collect();
         for mut o in legacy {
-            let Some(path) = o.account.path.as_deref() else { continue };
-            let path = parse_path(path).ok_or_else(|| err(ErrorCode::Invalid, "Invalid saved account path"))?;
+            let Some(path) = o.account.path.as_deref() else {
+                continue;
+            };
+            let path = parse_path(path)
+                .ok_or_else(|| err(ErrorCode::Invalid, "Invalid saved account path"))?;
             let key = commands::get_public(t, &path, false).map_err(shell)?;
             if hex::encode(key.key.serialize()) == o.key {
                 o.master_key_id = root_id.clone();
@@ -481,7 +572,11 @@ impl Shared {
                     }
                 }
             };
-            if req.fingerprint.as_ref().is_some_and(|fp| offered.account.fingerprint.as_ref() != Some(fp)) {
+            if req
+                .fingerprint
+                .as_ref()
+                .is_some_and(|fp| offered.account.fingerprint.as_ref() != Some(fp))
+            {
                 return Err(err(ErrorCode::Invalid, "The Shell contains a different wallet. Open the selected wallet on the Shell and try again."));
             }
             out.retain(|o| o.account.id != offered.account.id);
@@ -521,15 +616,31 @@ pub struct ShellSigner {
 }
 
 impl ShellSigner {
-    pub fn sign_offered(&mut self, request: SignRequest, mut offered: Offered) -> logos_signer_interface::Result<String> {
-        if !(if offered.account.family == Family::Evm { request.account.eq_ignore_ascii_case(&offered.account.id) } else { request.account == offered.account.id }) {
-            return Err(err(ErrorCode::Invalid, "Routed account does not match the request"));
+    pub fn sign_offered(
+        &mut self,
+        request: SignRequest,
+        mut offered: Offered,
+    ) -> logos_signer_interface::Result<String> {
+        if !(if offered.account.family == Family::Evm {
+            request.account.eq_ignore_ascii_case(&offered.account.id)
+        } else {
+            request.account == offered.account.id
+        }) {
+            return Err(err(
+                ErrorCode::Invalid,
+                "Routed account does not match the request",
+            ));
         }
         let work = Work::of(&offered, &request.payload)?;
         self.s.refresh_connected();
         let connected = lock(&self.s.connected).clone();
-        offered.serial = lock(&self.s.store).available_serial(&offered, &connected)
-            .or_else(|| (!offered.master_key_id.is_empty()).then(|| connected.first().cloned()).flatten())
+        offered.serial = lock(&self.s.store)
+            .available_serial(&offered, &connected)
+            .or_else(|| {
+                (!offered.master_key_id.is_empty())
+                    .then(|| connected.first().cloned())
+                    .flatten()
+            })
             .ok_or_else(|| err(ErrorCode::Unavailable, "No USB Shell is connected"))?;
         if self.s.busy.swap(true, Ordering::SeqCst) {
             return Err(err(
@@ -556,10 +667,20 @@ impl ShellSigner {
     }
 
     pub fn routing_accounts(&self) -> serde_json::Value {
-        lock(&self.s.store).list().iter().filter(|o| !o.master_key_id.is_empty())
-            .map(|o| (o.account.id.clone(), serde_json::json!({
-                "account": o.account, "masterKeyId": o.master_key_id, "key": o.key
-            }))).collect::<serde_json::Map<String, serde_json::Value>>().into()
+        lock(&self.s.store)
+            .list()
+            .iter()
+            .filter(|o| !o.master_key_id.is_empty())
+            .map(|o| {
+                (
+                    o.account.id.clone(),
+                    serde_json::json!({
+                        "account": o.account, "masterKeyId": o.master_key_id, "key": o.key
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>()
+            .into()
     }
     pub fn routing_connections(&self) -> serde_json::Value {
         self.s.refresh_connected();
@@ -615,8 +736,10 @@ impl ShellSigner {
         connected
             .into_iter()
             .map(|serial| {
-                let verified_master_key_id = lock(&self.s.sessions).get(&serial)
-                    .and_then(|s| s.root.as_ref()).map(|r| master_id(&r.key));
+                let verified_master_key_id = lock(&self.s.sessions)
+                    .get(&serial)
+                    .and_then(|s| s.root.as_ref())
+                    .map(|r| master_id(&r.key));
                 if self.s.busy.load(Ordering::SeqCst) {
                     return Device {
                         serial,
@@ -646,7 +769,10 @@ impl ShellSigner {
     /// Export the requested accounts from a connected Shell, each confirmed on it: a job id.
     pub fn add_accounts(&self, req: AddRequest) -> Result<String, SignerError> {
         if req.verify_only && (!req.families.is_empty() || req.identify) {
-            return Err(err(ErrorCode::Invalid, "Verification cannot also add or identify accounts"));
+            return Err(err(
+                ErrorCode::Invalid,
+                "Verification cannot also add or identify accounts",
+            ));
         }
         if req.families.is_empty() && !req.identify && !req.verify_only {
             return Err(err(ErrorCode::Invalid, "name at least one family"));
@@ -670,8 +796,12 @@ impl ShellSigner {
             ));
         }
         if req.verify_only {
-            if let Some(session) = lock(&self.s.sessions).get_mut(&serial) { session.root = None; }
-            self.s.events.accounts_changed(lock(&self.s.store).list().len());
+            if let Some(session) = lock(&self.s.sessions).get_mut(&serial) {
+                session.root = None;
+            }
+            self.s
+                .events
+                .accounts_changed(lock(&self.s.store).list().len());
         }
         let id = self.s.next_id("add");
         lock(&self.s.adds).insert(
@@ -728,63 +858,90 @@ impl ShellSigner {
         for (id, name) in store.wallet_names() {
             let mut serials = store.connections(id);
             if id.starts_with("shell:") {
-                if let Some(serial) = id.split(':').nth(1) { serials.push(serial.into()); }
+                if let Some(serial) = id.split(':').nth(1) {
+                    serials.push(serial.into());
+                }
             }
             let connections: Vec<_> = serials.iter().map(|serial| serde_json::json!({
                 "id": id, "serial": serial, "transport": "shell", "connected": connected.contains(serial)
             })).collect();
-            groups.insert(id.clone(), serde_json::json!({
-                "id": id, "name": name, "aliases": store.aliases(id), "transport": "shell",
-                "serial": serials.iter().find(|s| connected.contains(s)).or(serials.first()),
-                "connections": connections, "identified": id.starts_with("seed:"),
-                "connected": serials.iter().any(|s| connected.contains(s)), "accounts": []
-            }));
+            groups.insert(
+                id.clone(),
+                serde_json::json!({
+                    "id": id, "name": name, "aliases": store.aliases(id), "transport": "shell",
+                    "serial": serials.iter().find(|s| connected.contains(s)).or(serials.first()),
+                    "connections": connections, "identified": id.starts_with("seed:"),
+                    "connected": serials.iter().any(|s| connected.contains(s)), "accounts": []
+                }),
+            );
         }
         for o in store.list() {
             let id = crate::store::wallet_id(o);
             if let Some(g) = groups.get_mut(&id) {
                 let mut account = o.account.clone();
                 account.available = store.available_serial(o, &connected).is_some();
-                g["accounts"].as_array_mut().unwrap().push(serde_json::to_value(account).unwrap());
+                g["accounts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::to_value(account).unwrap());
             }
         }
         groups.into_values().collect()
     }
 
     pub fn rename_account(&self, id: &str, name: &str) -> Result<(), SignerError> {
-        lock(&self.s.store).rename_account(id, name)
+        lock(&self.s.store)
+            .rename_account(id, name)
             .map_err(|e| err(ErrorCode::Invalid, e.to_string()))?;
-        self.s.events.accounts_changed(lock(&self.s.store).list().len());
+        self.s
+            .events
+            .accounts_changed(lock(&self.s.store).list().len());
         Ok(())
     }
 
     pub fn rename_wallet(&self, id: &str, name: &str) -> Result<(), SignerError> {
-        lock(&self.s.store).rename_wallet(id, name)
+        lock(&self.s.store)
+            .rename_wallet(id, name)
             .map_err(|e| err(ErrorCode::Invalid, e.to_string()))?;
-        self.s.events.accounts_changed(lock(&self.s.store).list().len());
+        self.s
+            .events
+            .accounts_changed(lock(&self.s.store).list().len());
         Ok(())
     }
 
     pub fn forget_wallet(&self, id: &str) -> Result<(), SignerError> {
         if self.s.busy.swap(true, Ordering::SeqCst) {
-            return Err(err(ErrorCode::Busy, "The Shell is busy with another request"));
+            return Err(err(
+                ErrorCode::Busy,
+                "The Shell is busy with another request",
+            ));
         }
-        let result = lock(&self.s.store).forget_wallet(id)
+        let result = lock(&self.s.store)
+            .forget_wallet(id)
             .map_err(|e| err(ErrorCode::Invalid, e.to_string()));
         self.s.busy.store(false, Ordering::SeqCst);
-        self.s.events.accounts_changed(lock(&self.s.store).list().len());
+        self.s
+            .events
+            .accounts_changed(lock(&self.s.store).list().len());
         result
     }
 
     pub fn origins(&self) -> serde_json::Value {
         let store = lock(&self.s.store);
-        let entries: serde_json::Map<String, serde_json::Value> = store.list().iter().map(|o| {
-            let id = crate::store::wallet_id(o);
-            (o.account.id.clone(), serde_json::json!({
-                "devices": [{"kind": "keycard_shell", "id": o.serial, "name": ""}],
-                "phrase": {"id": id, "name": store.wallet_name(&id)}, "kind": "derived"
-            }))
-        }).collect();
+        let entries: serde_json::Map<String, serde_json::Value> = store
+            .list()
+            .iter()
+            .map(|o| {
+                let id = crate::store::wallet_id(o);
+                (
+                    o.account.id.clone(),
+                    serde_json::json!({
+                        "devices": [{"kind": "keycard_shell", "id": o.serial, "name": ""}],
+                        "phrase": {"id": id, "name": store.wallet_name(&id)}, "kind": "derived"
+                    }),
+                )
+            })
+            .collect();
         entries.into()
     }
 
@@ -834,7 +991,7 @@ impl Signer for ShellSigner {
     }
 
     fn sign(&mut self, request: SignRequest) -> logos_signer_interface::Result<String> {
-        let mut offered = lock(&self.s.store)
+        let offered = lock(&self.s.store)
             .find(&request.account)
             .cloned()
             .ok_or_else(|| {

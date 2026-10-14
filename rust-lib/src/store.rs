@@ -1,8 +1,8 @@
 //! The accounts offered, kept in the module's own directory as `accounts.json`: public material
 //! and the serial of the Shell each came from, nothing else.
 
-use std::path::PathBuf;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use logos_signer_interface::Account;
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,9 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => File::default(),
             Err(e) => return Err(e),
         };
-        for o in &file.accounts { file.wallet_names.entry(wallet_id(o)).or_default(); }
+        for o in &file.accounts {
+            file.wallet_names.entry(wallet_id(o)).or_default();
+        }
         Ok(Store {
             path: Some(path),
             offered: file.accounts,
@@ -73,15 +75,25 @@ impl Store {
     }
 
     /// Commit a verified root and account migration together. Keep old names as aliases.
-    pub fn put_identified(&mut self, add: Vec<Offered>, root: &str, serial: &str) -> std::io::Result<()> {
+    pub fn put_identified(
+        &mut self,
+        add: Vec<Offered>,
+        root: &str,
+        serial: &str,
+    ) -> std::io::Result<()> {
         self.check_keys(&add)?;
         let previous = self.clone();
         let id = format!("seed:{root}");
         self.wallet_names.entry(id.clone()).or_default();
         let connections = self.connections.entry(id).or_default();
-        if !connections.iter().any(|s| s == serial) { connections.push(serial.into()); }
+        if !connections.iter().any(|s| s == serial) {
+            connections.push(serial.into());
+        }
         self.merge(add);
-        if let Err(e) = self.save() { *self = previous; return Err(e); }
+        if let Err(e) = self.save() {
+            *self = previous;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -89,15 +101,22 @@ impl Store {
         self.check_keys(&add)?;
         let previous = self.clone();
         self.merge(add);
-        if let Err(e) = self.save() { *self = previous; return Err(e); }
+        if let Err(e) = self.save() {
+            *self = previous;
+            return Err(e);
+        }
         Ok(())
     }
 
     fn check_keys(&self, add: &[Offered]) -> std::io::Result<()> {
         for o in add {
             if let Some(old) = self.find(&o.account.id) {
-                if old.key != o.key || (!old.master_key_id.is_empty() && old.master_key_id != o.master_key_id) {
-                    return Err(std::io::Error::other("Account identifier belongs to another key; existing account was kept"));
+                if old.key != o.key
+                    || (!old.master_key_id.is_empty() && old.master_key_id != o.master_key_id)
+                {
+                    return Err(std::io::Error::other(
+                        "Account identifier belongs to another key; existing account was kept",
+                    ));
                 }
             }
         }
@@ -111,23 +130,35 @@ impl Store {
             self.wallet_names.entry(id.clone()).or_default();
             if !o.master_key_id.is_empty() {
                 let connections = self.connections.entry(id.clone()).or_default();
-                if !connections.contains(&o.serial) { connections.push(o.serial.clone()); }
+                if !connections.contains(&o.serial) {
+                    connections.push(o.serial.clone());
+                }
             }
-            if let Some(index) = self.offered.iter().position(|have| same(&have.account, &o.account.id)) {
+            if let Some(index) = self
+                .offered
+                .iter()
+                .position(|have| same(&have.account, &o.account.id))
+            {
                 let old = &self.offered[index];
                 let old_id = wallet_id(old);
                 o.account.label = old.account.label.clone();
                 if old_id != id {
                     let name = self.wallet_name(&old_id);
                     if !name.is_empty() {
-                        if self.wallet_name(&id).is_empty() { self.wallet_names.insert(id.clone(), name.clone()); }
+                        if self.wallet_name(&id).is_empty() {
+                            self.wallet_names.insert(id.clone(), name.clone());
+                        }
                         let aliases = self.aliases.entry(id.clone()).or_default();
-                        if !aliases.contains(&name) { aliases.push(name); }
+                        if !aliases.contains(&name) {
+                            aliases.push(name);
+                        }
                     }
                     old_ids.push(old_id);
                 }
                 self.offered[index] = o;
-            } else { self.offered.push(o); }
+            } else {
+                self.offered.push(o);
+            }
         }
         for id in old_ids {
             if !self.offered.iter().any(|o| wallet_id(o) == id) {
@@ -144,17 +175,26 @@ impl Store {
         self.aliases.get(id).cloned().unwrap_or_default()
     }
     pub fn available_serial(&self, o: &Offered, connected: &[String]) -> Option<String> {
-        if connected.contains(&o.serial) { return Some(o.serial.clone()); }
-        self.connections(&wallet_id(o)).into_iter().find(|s| connected.contains(s))
+        if connected.contains(&o.serial) {
+            return Some(o.serial.clone());
+        }
+        self.connections(&wallet_id(o))
+            .into_iter()
+            .find(|s| connected.contains(s))
     }
 
     /// Local display metadata only. A failed write must not change the offered account.
     pub fn rename_account(&mut self, id: &str, name: &str) -> std::io::Result<()> {
         let name = name.trim();
         if name.chars().count() > 80 || name.chars().any(char::is_control) {
-            return Err(std::io::Error::other("Account names must be at most 80 characters, without control characters"));
+            return Err(std::io::Error::other(
+                "Account names must be at most 80 characters, without control characters",
+            ));
         }
-        let index = self.offered.iter().position(|o| same(&o.account, id))
+        let index = self
+            .offered
+            .iter()
+            .position(|o| same(&o.account, id))
             .ok_or_else(|| std::io::Error::other("Unknown account"))?;
         let previous = self.offered[index].account.label.clone();
         self.offered[index].account.label = (!name.is_empty()).then(|| name.to_owned());
@@ -173,7 +213,9 @@ impl Store {
         Ok(self.offered.len() != before)
     }
 
-    pub fn wallet_names(&self) -> &BTreeMap<String, String> { &self.wallet_names }
+    pub fn wallet_names(&self) -> &BTreeMap<String, String> {
+        &self.wallet_names
+    }
 
     pub fn wallet_name(&self, id: &str) -> String {
         self.wallet_names.get(id).cloned().unwrap_or_default()
@@ -181,12 +223,18 @@ impl Store {
 
     pub fn rename_wallet(&mut self, id: &str, name: &str) -> std::io::Result<()> {
         let name = name.trim();
-        if !self.wallet_names.contains_key(id) || name.chars().count() > 80 || name.chars().any(char::is_control) {
+        if !self.wallet_names.contains_key(id)
+            || name.chars().count() > 80
+            || name.chars().any(char::is_control)
+        {
             return Err(std::io::Error::other("Unknown wallet or invalid name"));
         }
         let previous = self.wallet_names.clone();
         self.wallet_names.insert(id.into(), name.into());
-        if let Err(e) = self.save() { self.wallet_names = previous; return Err(e); }
+        if let Err(e) = self.save() {
+            self.wallet_names = previous;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -199,7 +247,10 @@ impl Store {
         self.wallet_names.remove(id);
         self.aliases.remove(id);
         self.connections.remove(id);
-        if let Err(e) = self.save() { *self = previous; return Err(e); }
+        if let Err(e) = self.save() {
+            *self = previous;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -233,6 +284,12 @@ fn same(a: &Account, id: &str) -> bool {
 
 /// The fingerprint is an organization hint supplied by the Shell, not a physical card ID.
 pub fn wallet_id(o: &Offered) -> String {
-    if !o.master_key_id.is_empty() { return format!("seed:{}", o.master_key_id); }
-    format!("shell:{}:{}", o.serial, o.account.fingerprint.as_deref().unwrap_or("unknown"))
+    if !o.master_key_id.is_empty() {
+        return format!("seed:{}", o.master_key_id);
+    }
+    format!(
+        "shell:{}:{}",
+        o.serial,
+        o.account.fingerprint.as_deref().unwrap_or("unknown")
+    )
 }

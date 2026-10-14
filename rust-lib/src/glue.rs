@@ -96,7 +96,9 @@ impl KeycardShellModule for KeycardShellModuleImpl {
     }
 
     fn signer_accounts(&self) -> String {
-        let mut reply: serde_json::Value = serde_json::from_str(&signer_json::signer_accounts(&mut self.shell.clone())).unwrap_or_default();
+        let mut reply: serde_json::Value =
+            serde_json::from_str(&signer_json::signer_accounts(&mut self.shell.clone()))
+                .unwrap_or_default();
         let origins = self.shell.origins();
         if let Some(rows) = reply["accounts"].as_array_mut() {
             for row in rows {
@@ -128,29 +130,53 @@ impl KeycardShellModule for KeycardShellModuleImpl {
             keycard_account: Option<serde_json::Value>,
         }
         let request: Routed = match serde_json::from_str(&request_json) {
-            Ok(r) => r, Err(e) => return err(e),
+            Ok(r) => r,
+            Err(e) => return err(e),
         };
         drop(request_json);
-        let req = logos_signer_interface::SignRequest { account: request.account, payload: request.payload, secret: request.secret };
+        let req = logos_signer_interface::SignRequest {
+            account: request.account,
+            payload: request.payload,
+            secret: request.secret,
+        };
         use logos_signer_interface::Signer;
         let result = if let Some(v) = request.keycard_account {
-            if !matches!(logos_rust_sdk::current_caller(), logos_rust_sdk::LogosCaller::Module { name, .. } if name == "signer_manager_module") {
+            if !matches!(logos_rust_sdk::current_caller(), logos_rust_sdk::LogosCaller::Module { name, .. } if name == "signer_manager_module")
+            {
                 return err("Only the signer manager can route public Keycard accounts");
             }
-            let account: logos_signer_interface::Account = match serde_json::from_value(v["account"].clone()) {
-                Ok(a) => a, Err(e) => return err(e),
-            };
+            let account: logos_signer_interface::Account =
+                match serde_json::from_value(v["account"].clone()) {
+                    Ok(a) => a,
+                    Err(e) => return err(e),
+                };
             let root = v["masterKeyId"].as_str().unwrap_or_default();
             let key = v["key"].as_str().unwrap_or_default();
-            if root.len() != 64 || hex::decode(root).is_err() || hex::decode(key).ok()
-                .and_then(|k| bitcoin::secp256k1::PublicKey::from_slice(&k).ok()).is_none() {
+            if root.len() != 64
+                || hex::decode(root).is_err()
+                || hex::decode(key)
+                    .ok()
+                    .and_then(|k| bitcoin::secp256k1::PublicKey::from_slice(&k).ok())
+                    .is_none()
+            {
                 return err("Invalid public Keycard routing metadata");
             }
-            self.shell.clone().sign_offered(req, crate::store::Offered {
-                account, master_key_id: root.into(), key: key.into(), serial: String::new()
-            })
-        } else { self.shell.clone().sign(req) };
-        match result { Ok(job) => json!({"ok": true, "job": job}).to_string(), Err(e) => signer_err(e) }
+            self.shell.clone().sign_offered(
+                req,
+                crate::store::Offered {
+                    account,
+                    master_key_id: root.into(),
+                    key: key.into(),
+                    serial: String::new(),
+                },
+            )
+        } else {
+            self.shell.clone().sign(req)
+        };
+        match result {
+            Ok(job) => json!({"ok": true, "job": job}).to_string(),
+            Err(e) => signer_err(e),
+        }
     }
 
     fn sign_status(&self, job: String) -> String {
@@ -173,14 +199,23 @@ impl KeycardShellModule for KeycardShellModuleImpl {
         json!({"ok": true, "groups": self.shell.wallet_groups()}).to_string()
     }
     fn rename_account(&self, id: String, name: String) -> String {
-        match self.shell.rename_account(&id, &name) { Ok(()) => json!({"ok":true}).to_string(), Err(e) => signer_err(e) }
+        match self.shell.rename_account(&id, &name) {
+            Ok(()) => json!({"ok":true}).to_string(),
+            Err(e) => signer_err(e),
+        }
     }
 
     fn rename_wallet(&self, id: String, name: String) -> String {
-        match self.shell.rename_wallet(&id, &name) { Ok(()) => json!({"ok":true}).to_string(), Err(e) => signer_err(e) }
+        match self.shell.rename_wallet(&id, &name) {
+            Ok(()) => json!({"ok":true}).to_string(),
+            Err(e) => signer_err(e),
+        }
     }
     fn forget_wallet(&self, id: String) -> String {
-        match self.shell.forget_wallet(&id) { Ok(()) => json!({"ok":true}).to_string(), Err(e) => signer_err(e) }
+        match self.shell.forget_wallet(&id) {
+            Ok(()) => json!({"ok":true}).to_string(),
+            Err(e) => signer_err(e),
+        }
     }
 
     fn add_accounts(&self, params_json: String) -> String {
