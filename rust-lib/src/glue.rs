@@ -25,6 +25,9 @@ pub trait KeycardShellModule: Send + Sync + 'static {
     // ── the Shell's app ─────────────────────────────────────────────────
     /// The Shells connected now: `{ ok, devices: [{ serial, firmware?, database?, busy }] }`.
     fn devices(&self) -> String;
+    fn wallet_groups(&self) -> String;
+    fn rename_wallet(&self, id: String, name: String) -> String;
+    fn forget_wallet(&self, id: String) -> String;
     /// Export accounts from a connected Shell, each confirmed on it:
     /// `{ families, chain?, account?, label?, serial? }` → `{ ok, job }`.
     fn add_accounts(&self, params_json: String) -> String;
@@ -32,6 +35,8 @@ pub trait KeycardShellModule: Send + Sync + 'static {
     fn add_status(&self, job: String) -> String;
     /// Stop offering an account: `{ ok, removed }`. Nothing on the Shell changes.
     fn remove_account(&self, id: String) -> String;
+    /// Rename a locally offered account; an empty name restores the default.
+    fn rename_account(&self, id: String, name: String) -> String;
 
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}
 }
@@ -91,11 +96,61 @@ impl KeycardShellModule for KeycardShellModuleImpl {
     }
 
     fn signer_accounts(&self) -> String {
-        signer_json::signer_accounts(&mut self.shell.clone())
+        let mut reply: serde_json::Value = serde_json::from_str(&signer_json::signer_accounts(&mut self.shell.clone())).unwrap_or_default();
+        let origins = self.shell.origins();
+        if let Some(rows) = reply["accounts"].as_array_mut() {
+            for row in rows {
+                if let Some(origin) = row["id"].as_str().and_then(|id| origins.get(id)) {
+                    row["origin"] = origin.clone();
+                }
+            }
+        }
+        let public = self.shell.routing_accounts();
+        if let Some(rows) = reply["accounts"].as_array_mut() {
+            for row in rows {
+                if let Some(offer) = row["id"].as_str().and_then(|id| public.get(id)) {
+                    row["keycardAccount"] = offer.clone();
+                }
+            }
+        }
+        reply["keycardRouting"] = self.shell.routing_connections();
+        reply.to_string()
     }
 
     fn sign(&self, request_json: String) -> String {
-        signer_json::sign(&mut self.shell.clone(), &request_json)
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Routed {
+            account: String,
+            #[serde(flatten)]
+            payload: logos_signer_interface::Payload,
+            secret: Option<logos_signer_interface::Secret>,
+            keycard_account: Option<serde_json::Value>,
+        }
+        let request: Routed = match serde_json::from_str(&request_json) {
+            Ok(r) => r, Err(e) => return err(e),
+        };
+        drop(request_json);
+        let req = logos_signer_interface::SignRequest { account: request.account, payload: request.payload, secret: request.secret };
+        use logos_signer_interface::Signer;
+        let result = if let Some(v) = request.keycard_account {
+            if !matches!(logos_rust_sdk::current_caller(), logos_rust_sdk::LogosCaller::Module { name, .. } if name == "signer_manager_module") {
+                return err("Only the signer manager can route public Keycard accounts");
+            }
+            let account: logos_signer_interface::Account = match serde_json::from_value(v["account"].clone()) {
+                Ok(a) => a, Err(e) => return err(e),
+            };
+            let root = v["masterKeyId"].as_str().unwrap_or_default();
+            let key = v["key"].as_str().unwrap_or_default();
+            if root.len() != 64 || hex::decode(root).is_err() || hex::decode(key).ok()
+                .and_then(|k| bitcoin::secp256k1::PublicKey::from_slice(&k).ok()).is_none() {
+                return err("Invalid public Keycard routing metadata");
+            }
+            self.shell.clone().sign_offered(req, crate::store::Offered {
+                account, master_key_id: root.into(), key: key.into(), serial: String::new()
+            })
+        } else { self.shell.clone().sign(req) };
+        match result { Ok(job) => json!({"ok": true, "job": job}).to_string(), Err(e) => signer_err(e) }
     }
 
     fn sign_status(&self, job: String) -> String {
@@ -112,6 +167,20 @@ impl KeycardShellModule for KeycardShellModuleImpl {
 
     fn devices(&self) -> String {
         json!({ "ok": true, "devices": self.shell.devices() }).to_string()
+    }
+
+    fn wallet_groups(&self) -> String {
+        json!({"ok": true, "groups": self.shell.wallet_groups()}).to_string()
+    }
+    fn rename_account(&self, id: String, name: String) -> String {
+        match self.shell.rename_account(&id, &name) { Ok(()) => json!({"ok":true}).to_string(), Err(e) => signer_err(e) }
+    }
+
+    fn rename_wallet(&self, id: String, name: String) -> String {
+        match self.shell.rename_wallet(&id, &name) { Ok(()) => json!({"ok":true}).to_string(), Err(e) => signer_err(e) }
+    }
+    fn forget_wallet(&self, id: String) -> String {
+        match self.shell.forget_wallet(&id) { Ok(()) => json!({"ok":true}).to_string(), Err(e) => signer_err(e) }
     }
 
     fn add_accounts(&self, params_json: String) -> String {

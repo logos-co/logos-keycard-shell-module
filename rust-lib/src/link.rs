@@ -100,6 +100,15 @@ pub trait Devices: Send + Sync {
     fn connected(&self) -> Vec<String>;
     /// A link to the Shell with this serial.
     fn open(&self, serial: &str) -> Result<Box<dyn Transport>>;
+    /// Enumeration identity for this attachment, distinct from the persistent USB serial.
+    /// Backends without an attachment ID rely on observing absence between connections.
+    fn connections(&self) -> Vec<(String, String)> {
+        self.connected().into_iter().map(|serial| (serial.clone(), serial)).collect()
+    }
+    /// Open the exact attachment that was enumerated, not a replacement with the same serial.
+    fn open_connection(&self, serial: &str, _token: &str) -> Result<Box<dyn Transport>> {
+        self.open(serial)
+    }
 }
 
 /// The emulator, at `host:port`, as one connected Shell.
@@ -193,15 +202,30 @@ impl Frames for HidFrames {
 #[cfg(feature = "hid")]
 impl Devices for Usb {
     fn connected(&self) -> Vec<String> {
+        self.connections().into_iter().map(|(serial, _)| serial).collect()
+    }
+
+    fn connections(&self) -> Vec<(String, String)> {
         self.with_api(|api| {
-            let _ = api.refresh_devices();
-            Ok(api
-                .device_list()
+            api.refresh_devices().map_err(|e| ShellError::Link(format!("USB: {e}")))?;
+            Ok(api.device_list()
                 .filter(|d| d.vendor_id() == VENDOR_ID && d.product_id() == PRODUCT_ID)
-                .filter_map(|d| d.serial_number().map(str::to_lowercase))
+                // macOS HID paths contain the IORegistry service entry ID, so even a
+                // reconnect between polls creates a new token. Other platforms also
+                // invalidate on a changed path or an observed removal/link failure.
+                .filter_map(|d| d.serial_number().map(|serial|
+                    (serial.to_lowercase(), d.path().to_string_lossy().into_owned())))
                 .collect())
+        }).unwrap_or_default()
+    }
+
+    fn open_connection(&self, _serial: &str, token: &str) -> Result<Box<dyn Transport>> {
+        let path = std::ffi::CString::new(token)
+            .map_err(|_| ShellError::Link("invalid USB path".into()))?;
+        self.with_api(|api| {
+            let device = api.open_path(&path).map_err(gone)?;
+            Ok(Box::new(Link::new(HidFrames(device))) as Box<dyn Transport>)
         })
-        .unwrap_or_default()
     }
 
     fn open(&self, serial: &str) -> Result<Box<dyn Transport>> {
