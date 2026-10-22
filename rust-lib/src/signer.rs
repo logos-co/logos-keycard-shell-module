@@ -10,10 +10,12 @@ use std::time::Duration;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::Psbt;
-use logos_signer_interface::jobs::JobTable;
+use logos_signer_interface::jobs::{JobTable, KeyJobs};
+use logos_signer_interface::unlock::{evm_path_ok, is_reserved, roster_key, PURPOSE};
 use logos_signer_interface::{
-    Account, Chain, Collects, ErrorCode, Family, JobState, JobStatus, Payload, RequestKind,
-    SignRequest, Signature, Signer, SignerError, SignerInfo, INTERFACE,
+    Account, Chain, Collects, ErrorCode, Family, JobState, JobStatus, Payload, RequestKind, Secret,
+    SignRequest, Signature, Signer, SignerError, SignerInfo, UnlockKey, UnlockKeyRequest,
+    INTERFACE,
 };
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +31,9 @@ pub trait Events: Send + Sync {
     fn sign_progress(&self, job: &str, state: JobState);
     fn accounts_changed(&self, count: usize);
     fn device_changed(&self, connected: bool);
+    /// Accounts of a seed were added, with its unlock key at index 0 when the Shell gave it: the
+    /// glue registers the seed with the signer manager.
+    fn seed_added(&self, _seed: &str, _unlock_key: Option<[u8; 33]>, _name: &str) {}
 }
 
 /// Announces nothing, for tests.
@@ -105,6 +110,8 @@ struct Shared {
     devices: Box<dyn Devices>,
     store: Mutex<Store>,
     jobs: Mutex<JobTable>,
+    /// Unlock-key jobs: read once, by the manager only, and announced nowhere.
+    keys: Mutex<KeyJobs>,
     adds: Mutex<HashMap<String, Added>>,
     connected: Mutex<Vec<String>>,
     sessions: Mutex<HashMap<String, ConnectionSession>>,
@@ -175,6 +182,12 @@ impl Work {
         let unhex = |s: &str| {
             hex::decode(s.trim().trim_start_matches("0x")).map_err(|_| invalid("not hex".into()))
         };
+        // An edited store could name a path no account has: nothing signs there.
+        if let Some(path) = account.path.as_deref() {
+            if is_reserved(path) || (account.family == Family::Evm && !evm_path_ok(path)) {
+                return Err(invalid(format!("{path} is not an account's path")));
+            }
+        }
         let evm_path = || {
             parse_path(account.path.as_deref().unwrap_or_default())
                 .ok_or_else(|| invalid("account path".into()))
@@ -299,6 +312,9 @@ fn name_internal_keys(psbt: &mut Psbt, fingerprint: [u8; 4]) -> Result<(), Signe
     }
     Ok(())
 }
+
+/// What an add exported: the accounts, the seed's master key id, and its unlock key at index 0.
+type Exported = (Vec<Offered>, String, Option<[u8; 33]>);
 
 impl Shared {
     fn refresh_connected(&self) {
@@ -486,11 +502,51 @@ impl Shared {
         }
     }
 
-    fn export(
+    /// A connected Shell whose verified root is the seed `master_key_id`.
+    fn holding(
         &self,
-        serial: &str,
-        req: &AddRequest,
-    ) -> Result<(Vec<Offered>, String), SignerError> {
+        master_key_id: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(Box<dyn crate::apdu::Transport>, String, u64), SignerError> {
+        let candidates = lock(&self.connected).clone();
+        for serial in candidates {
+            if cancelled() {
+                return Err(err(ErrorCode::Refused, "Request cancelled"));
+            }
+            let Ok((mut t, epoch)) = self.open_session(&serial) else {
+                continue;
+            };
+            let root = self.verified_root(&serial, epoch, &mut *t)?;
+            if master_id(&root.key) == master_key_id {
+                return Ok((t, serial, epoch));
+            }
+        }
+        Err(err(
+            ErrorCode::Unavailable,
+            "No connected Shell has this wallet's seed. Insert its Keycard and retry.",
+        ))
+    }
+
+    /// The seed's unlock key at `index`, confirmed on a Shell holding it.
+    fn unlock_key_now(&self, seed: &str, index: u32, job: &str) -> Result<UnlockKey, SignerError> {
+        let cancelled = || {
+            lock(&self.keys)
+                .status(job)
+                .is_ok_and(|s| s.state == JobState::Cancelled)
+        };
+        let (mut transport, serial, epoch) = self.holding(seed, &cancelled)?;
+        let key = commands::get_public(
+            &mut *transport,
+            &[HARDENED | PURPOSE, HARDENED | index],
+            false,
+        )
+        .map_err(|e| self.connection_error(&serial, epoch, e, false))?;
+        Ok(UnlockKey {
+            key: Secret::new(hex::encode(key.key.serialize())),
+        })
+    }
+
+    fn export(&self, serial: &str, req: &AddRequest) -> Result<Exported, SignerError> {
         let (mut t, epoch) = self.open_session(serial)?;
         let shell = |e| self.connection_error(serial, epoch, e, false);
         let t = &mut *t;
@@ -503,7 +559,7 @@ impl Shared {
             ));
         }
         if req.verify_only {
-            return Ok((Vec::new(), root_id));
+            return Ok((Vec::new(), root_id, None));
         }
         let mut out = Vec::new();
         // A short fingerprint cannot prove that legacy accounts share this root. Re-export
@@ -582,7 +638,12 @@ impl Shared {
             out.retain(|o| o.account.id != offered.account.id);
             out.push(offered);
         }
-        Ok((out, root_id))
+        // One more confirmation: the seed's unlock key, so adding never asks twice. A Shell that
+        // won't export it still adds; its wallet then unlocks by a password.
+        let unlock_key = commands::get_public(t, &[HARDENED | PURPOSE, HARDENED], false)
+            .ok()
+            .map(|k| k.key.serialize());
+        Ok((out, root_id, unlock_key))
     }
 
     fn next_id(&self, prefix: &str) -> String {
@@ -630,6 +691,17 @@ impl ShellSigner {
                 ErrorCode::Invalid,
                 "Routed account does not match the request",
             ));
+        }
+        if let (Some(brought), Some(listed)) =
+            (request.xpub.as_deref(), offered.account.xpub.as_deref())
+        {
+            let (family, chain) = (offered.account.family, offered.account.chain);
+            if roster_key(family, chain, brought).ok() != roster_key(family, chain, listed).ok() {
+                return Err(err(
+                    ErrorCode::Invalid,
+                    "the request's xpub is not this account's",
+                ));
+            }
         }
         let work = Work::of(&offered, &request.payload)?;
         self.s.refresh_connected();
@@ -692,6 +764,7 @@ impl ShellSigner {
             devices,
             store: Mutex::new(store),
             jobs: Mutex::new(JobTable::new()),
+            keys: Mutex::new(KeyJobs::new()),
             adds: Mutex::new(HashMap::new()),
             connected: Mutex::new(Vec::new()),
             sessions: Mutex::new(HashMap::new()),
@@ -816,12 +889,24 @@ impl ShellSigner {
         let job = id.clone();
         std::thread::spawn(move || {
             let outcome = s.export(&serial, &req);
-            let added = match outcome.and_then(|(offered, root)| {
-                let accounts = offered.iter().map(|o| o.account.clone()).collect();
+            let added = match outcome.and_then(|(offered, root, unlock_key)| {
+                let accounts = offered
+                    .iter()
+                    .map(|o| Account {
+                        seed: Some(root.clone()),
+                        ..o.account.clone()
+                    })
+                    .collect();
                 if !req.verify_only {
                     lock(&s.store)
                         .put_identified(offered, &root, &serial)
                         .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
+                    let name = req
+                        .label
+                        .clone()
+                        .filter(|n| !n.trim().is_empty())
+                        .unwrap_or_else(|| "Keycard Shell".into());
+                    s.events.seed_added(&root, unlock_key, &name);
                 }
                 Ok(accounts)
             }) {
@@ -974,18 +1059,48 @@ impl Signer for ShellSigner {
             ],
             shows_request: true,
             collects: Collects::Nothing,
+            unlock_key: true,
         }
     }
 
     fn accounts(&mut self) -> logos_signer_interface::Result<Vec<Account>> {
         let connected = lock(&self.s.connected).clone();
+        // What each connected Shell is known to hold: its verified root, or nothing known yet.
+        let roots: Vec<(String, Option<String>)> = {
+            let sessions = lock(&self.s.sessions);
+            connected
+                .iter()
+                .map(|serial| {
+                    (
+                        serial.clone(),
+                        sessions
+                            .get(serial)
+                            .and_then(|s| s.root.as_ref())
+                            .map(|r| master_id(&r.key)),
+                    )
+                })
+                .collect()
+        };
         let store = lock(&self.s.store);
         Ok(store
             .list()
             .iter()
-            .map(|o| Account {
-                available: store.available_serial(o, &connected).is_some(),
-                ..o.account.clone()
+            .map(|o| {
+                // A Shell verified to hold another seed doesn't make this one's accounts available.
+                let unverified: Vec<String> = roots
+                    .iter()
+                    .filter(|(_, r)| r.is_none())
+                    .map(|(s, _)| s.clone())
+                    .collect();
+                let verified = !o.master_key_id.is_empty()
+                    && roots
+                        .iter()
+                        .any(|(_, r)| r.as_deref() == Some(o.master_key_id.as_str()));
+                Account {
+                    available: verified || store.available_serial(o, &unverified).is_some(),
+                    seed: (!o.master_key_id.is_empty()).then(|| o.master_key_id.clone()),
+                    ..o.account.clone()
+                }
             })
             .collect())
     }
@@ -1014,5 +1129,53 @@ impl Signer for ShellSigner {
     /// The Shell keeps showing the request until the person answers it; the answer is dropped.
     fn cancel(&mut self, job: &str) -> logos_signer_interface::Result<()> {
         lock(&self.s.jobs).cancel(job)
+    }
+
+    /// A seed's unlock key, from a connected Shell holding that seed once its person confirms
+    /// the export. The job waits in `confirm_on_device`.
+    fn unlock_key(&mut self, request: UnlockKeyRequest) -> logos_signer_interface::Result<String> {
+        logos_signer_interface::unlock::unlock_key_path(request.index)?;
+        let seed = request.seed.trim().to_string();
+        if !lock(&self.s.store)
+            .list()
+            .iter()
+            .any(|o| o.master_key_id == seed)
+        {
+            return Err(err(
+                ErrorCode::WrongSeed,
+                "no Shell account comes from this seed",
+            ));
+        }
+        self.s.refresh_connected();
+        if lock(&self.s.connected).is_empty() {
+            return Err(err(ErrorCode::Unavailable, "No USB Shell is connected"));
+        }
+        if self.s.busy.swap(true, Ordering::SeqCst) {
+            return Err(err(
+                ErrorCode::Busy,
+                "the Keycard Shell is busy with another request",
+            ));
+        }
+        let job = lock(&self.s.keys).start(JobState::ConfirmOnDevice);
+        let s = Arc::clone(&self.s);
+        let id = job.clone();
+        std::thread::spawn(move || {
+            let outcome = s.unlock_key_now(&seed, request.index, &id);
+            s.busy.store(false, Ordering::SeqCst);
+            let _ = lock(&s.keys).finish(&id, outcome);
+        });
+        Ok(job)
+    }
+
+    fn unlock_key_status(&mut self, job: &str) -> logos_signer_interface::Result<JobStatus> {
+        lock(&self.s.keys).status(job)
+    }
+
+    fn unlock_key_result(&mut self, job: &str) -> logos_signer_interface::Result<UnlockKey> {
+        lock(&self.s.keys).take(job)
+    }
+
+    fn cancel_unlock_key(&mut self, job: &str) -> logos_signer_interface::Result<()> {
+        lock(&self.s.keys).cancel(job)
     }
 }

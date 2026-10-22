@@ -21,7 +21,7 @@ path = "src/bin/emulator.rs"
 required-features = ["emulator"]
 
 [dependencies]
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "c68e987c2b0303a444f2b2159cdfacffb4c287f7" }
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "ca091a9330d455a5b60b80537e34dc535d1e6503" }
 # PSBTs, BIP32 keys and secp256k1. The plugin's export list keeps libsecp256k1 in.
 bitcoin = { version = "0.32.102", default-features = false, features = ["std", "base64"] }
 serde = { version = "1", features = ["derive"] }
@@ -40,7 +40,7 @@ alloy = { version = "1", default-features = false, features = ["std", "dyn-abi",
 logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
 
 [dev-dependencies]
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "c68e987c2b0303a444f2b2159cdfacffb4c287f7", features = ["mock", "conformance"] }
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "ca091a9330d455a5b60b80537e34dc535d1e6503", features = ["mock", "conformance"] }
 
 [features]
 default = ["logos_module", "hid"]

@@ -21,6 +21,13 @@ pub trait KeycardShellModule: Send + Sync + 'static {
     fn sign_status(&self, job: String) -> String;
     fn sign_result(&self, job: String) -> String;
     fn cancel_sign(&self, job: String) -> String;
+    /// A seed's unlock key, for the signer manager alone: `{ seed, index }` → `{ ok, job }`; the
+    /// job waits in `confirm_on_device` until the person confirms on a Shell holding the seed.
+    fn unlock_key(&self, request_json: String) -> String;
+    fn unlock_key_status(&self, job: String) -> String;
+    /// `{ ok, job, key }`, once: the job forgets it.
+    fn unlock_key_result(&self, job: String) -> String;
+    fn cancel_unlock_key(&self, job: String) -> String;
 
     // ── the Shell's app ─────────────────────────────────────────────────
     /// The Shells connected now: `{ ok, devices: [{ serial, firmware?, database?, busy }] }`.
@@ -52,9 +59,24 @@ include!(concat!(
     "/generated/provider_gen.rs"
 ));
 
+/// The module behind `logos.wallets/1`: the signer manager, bound at runtime, since it depends on
+/// this module and this module can't depend on it.
+const WALLETS: &str = "signer_manager_module";
+
+fn from_manager() -> bool {
+    matches!(logos_rust_sdk::current_caller(), logos_rust_sdk::LogosCaller::Module { name, .. } if name == WALLETS)
+}
+
 struct Emit;
 
 impl Events for Emit {
+    /// The seed goes to the signer manager while its unlock key is at hand, so the person never
+    /// unlocks it a second time. Asked without waiting: without a manager the add stands.
+    fn seed_added(&self, seed: &str, unlock_key: Option<[u8; 33]>, name: &str) {
+        let body = json!({ "seed": seed, "kind": "keycard_shell", "unlockKey": unlock_key.map(hex::encode), "name": name })
+            .to_string();
+        wallets::WalletsClient::bind(WALLETS).enroll_seed_async(&body, |_| {});
+    }
     fn sign_progress(&self, job: &str, state: JobState) {
         emit_sign_progress(job, state.as_str());
     }
@@ -127,6 +149,8 @@ impl KeycardShellModule for KeycardShellModuleImpl {
             #[serde(flatten)]
             payload: logos_signer_interface::Payload,
             secret: Option<logos_signer_interface::Secret>,
+            #[serde(default)]
+            xpub: Option<String>,
             keycard_account: Option<serde_json::Value>,
         }
         let request: Routed = match serde_json::from_str(&request_json) {
@@ -138,6 +162,7 @@ impl KeycardShellModule for KeycardShellModuleImpl {
             account: request.account,
             payload: request.payload,
             secret: request.secret,
+            xpub: request.xpub,
         };
         use logos_signer_interface::Signer;
         let result = if let Some(v) = request.keycard_account {
@@ -189,6 +214,34 @@ impl KeycardShellModule for KeycardShellModuleImpl {
 
     fn cancel_sign(&self, job: String) -> String {
         signer_json::cancel_sign(&mut self.shell.clone(), &job)
+    }
+
+    fn unlock_key(&self, request_json: String) -> String {
+        if !from_manager() {
+            return err("not authorized");
+        }
+        signer_json::unlock_key(&mut self.shell.clone(), &request_json)
+    }
+
+    fn unlock_key_status(&self, job: String) -> String {
+        if !from_manager() {
+            return err("not authorized");
+        }
+        signer_json::unlock_key_status(&mut self.shell.clone(), &job)
+    }
+
+    fn unlock_key_result(&self, job: String) -> String {
+        if !from_manager() {
+            return err("not authorized");
+        }
+        signer_json::unlock_key_result(&mut self.shell.clone(), &job)
+    }
+
+    fn cancel_unlock_key(&self, job: String) -> String {
+        if !from_manager() {
+            return err("not authorized");
+        }
+        signer_json::cancel_unlock_key(&mut self.shell.clone(), &job)
     }
 
     fn devices(&self) -> String {

@@ -144,6 +144,7 @@ fn sign(rig: &mut Rig, account: &Account, payload: Payload) -> Result<Vec<Signat
         account: account.id.clone(),
         payload,
         secret: None,
+        xpub: None,
     })?;
     settle(rig, &job, true);
     rig.shell.result(&job)
@@ -197,12 +198,20 @@ fn it_passes_the_conformance_suite() {
             wrong_secret: None,
         },
         &mut |s, job| {
-            answer_until(&emu, true, || {
-                emu.asking().is_some() || s.status(job).unwrap().state.is_final()
-            });
+            answer_until(&emu, true, || emu.asking().is_some() || ended(s, job));
             emu.press(true);
         },
     );
+}
+
+/// A signing job or an unlock-key job has settled, whichever `job` is.
+fn ended(s: &mut ShellSigner, job: &str) -> bool {
+    match s.status(job) {
+        Ok(st) => st.state.is_final(),
+        Err(_) => s
+            .unlock_key_status(job)
+            .map_or(true, |st| st.state.is_final()),
+    }
 }
 
 #[test]
@@ -262,6 +271,7 @@ fn a_refusal_on_the_shell_is_a_refused_job() {
                 message: hex::encode("no thanks"),
             },
             secret: None,
+            xpub: None,
         })
         .unwrap();
     let st = settle(&mut rig, &job, false);
@@ -280,6 +290,7 @@ fn a_refusal_on_the_shell_is_a_refused_job() {
                 psbt,
             },
             secret: None,
+            xpub: None,
         })
         .unwrap();
     let st = settle(&mut rig, &job, false);
@@ -300,6 +311,7 @@ fn one_request_at_a_time_and_a_cancelled_one_signs_nothing() {
             message: hex::encode(text),
         },
         secret: None,
+        xpub: None,
     };
     let first = rig.shell.sign(ask("first")).unwrap();
     assert_eq!(
@@ -340,6 +352,7 @@ fn an_unplugged_shell_keeps_its_accounts_listed_and_signs_nothing() {
                 message: "00".into(),
             },
             secret: None,
+            xpub: None,
         })
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::Unavailable);
@@ -422,6 +435,7 @@ fn a_taproot_psbt_naming_another_internal_key_is_refused_before_the_shell() {
                 psbt,
             },
             secret: None,
+            xpub: None,
         })
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid, "{}", e.message);
@@ -736,6 +750,7 @@ fn one_seed_on_two_shells_is_one_wallet_and_signs_through_the_remaining_shell() 
                 message: hex::encode("remaining Shell"),
             },
             secret: None,
+            xpub: None,
         })
         .unwrap();
     answer_until(&emu, true, || shell.status(&job).unwrap().state.is_final());
@@ -761,6 +776,7 @@ fn a_public_offer_uses_an_unregistered_shell_without_importing_or_reexporting_th
             message: hex::encode(b"routing test"),
         },
         secret: None,
+        xpub: None,
     };
     let job = target.shell.sign_offered(request(), offer.clone()).unwrap();
     assert_eq!(settle(&mut target, &job, true).state, JobState::Done);
@@ -830,6 +846,7 @@ fn a_different_seed_is_skipped_but_a_refusal_ends_verification() {
                         message: hex::encode("two connections"),
                     },
                     secret: None,
+                    xpub: None,
                 },
                 offer,
             )
@@ -931,6 +948,7 @@ fn root_verification_is_per_attachment_and_never_persisted() {
             message: hex::encode("session test"),
         },
         secret: None,
+        xpub: None,
     };
     let attempt = |target: &mut ShellSigner| {
         let job = target.sign_offered(request(), offer.clone()).unwrap();
@@ -1028,6 +1046,7 @@ fn refused_verification_is_not_cached() {
                         message: hex::encode("no"),
                     },
                     secret: None,
+                    xpub: None,
                 },
                 offer.clone(),
             )
@@ -1132,5 +1151,119 @@ fn manual_verification_replaces_the_cache_without_changing_saved_wallets() {
         target.wallet_groups(),
         before,
         "verification must not import or regroup a different wallet"
+    );
+}
+
+/// The phrase's own key at `m/1280263247'/n'`, as any other holder of it gives.
+fn phrase_unlock_key(phrase: &str, n: u32) -> String {
+    use bitcoin::bip32::{DerivationPath, Xpriv, Xpub};
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let seed = bip39_seed(phrase);
+    let master = Xpriv::new_master(bitcoin::NetworkKind::Test, &seed).unwrap();
+    let path = DerivationPath::from_str(&format!("m/1280263247'/{n}'")).unwrap();
+    hex::encode(
+        Xpub::from_priv(&secp, &master.derive_priv(&secp, &path).unwrap())
+            .public_key
+            .serialize(),
+    )
+}
+
+fn bip39_seed(phrase: &str) -> [u8; 64] {
+    let mut seed = [0u8; 64];
+    pbkdf2::pbkdf2_hmac::<sha2::Sha512>(phrase.as_bytes(), b"mnemonic", 2048, &mut seed);
+    seed
+}
+
+#[test]
+fn the_shell_gives_its_phrases_unlock_key_once_its_person_confirms() {
+    let mut rig = rig_with(Store::new());
+    let added = add(&rig, vec![Family::Evm], Chain::Test);
+    let seed = added[0]
+        .seed
+        .clone()
+        .expect("an added account names its seed");
+    assert_eq!(
+        rig.shell.accounts().unwrap()[0].seed.as_deref(),
+        Some(seed.as_str())
+    );
+
+    let job = rig
+        .shell
+        .unlock_key(UnlockKeyRequest {
+            seed: seed.clone(),
+            index: 1,
+            secret: None,
+        })
+        .unwrap();
+    assert_eq!(
+        rig.shell.unlock_key_status(&job).unwrap().state,
+        JobState::ConfirmOnDevice
+    );
+    answer_until(&rig.emu, true, || {
+        rig.shell.unlock_key_status(&job).unwrap().state.is_final()
+    });
+    assert_eq!(
+        rig.shell.unlock_key_result(&job).unwrap().key.expose(),
+        phrase_unlock_key(PHRASE, 1)
+    );
+
+    // Declined on the Shell: refused, and no key.
+    let job = rig
+        .shell
+        .unlock_key(UnlockKeyRequest {
+            seed,
+            index: 0,
+            secret: None,
+        })
+        .unwrap();
+    answer_until(&rig.emu, false, || {
+        rig.shell.unlock_key_status(&job).unwrap().state.is_final()
+    });
+    assert_eq!(
+        rig.shell.unlock_key_status(&job).unwrap().state,
+        JobState::Refused
+    );
+    let foreign = rig.shell.unlock_key(UnlockKeyRequest {
+        seed: "00".repeat(32),
+        index: 0,
+        secret: None,
+    });
+    assert_eq!(foreign.unwrap_err().code, ErrorCode::WrongSeed);
+}
+
+#[test]
+fn a_shell_verified_to_hold_another_seed_leaves_this_ones_accounts_unavailable() {
+    let rig = rig_with(Store::new());
+    let added = add(&rig, vec![Family::Evm], Chain::Test);
+    let mut shell = rig.shell;
+    assert!(
+        shell.accounts().unwrap()[0].available,
+        "its own verified Shell is connected"
+    );
+
+    // The same store, with the accounts' seed changed to one the connected Shell doesn't hold.
+    let mut other = Store::new();
+    let theirs: Vec<_> = shell
+        .routing_accounts()
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|v| keycard_shell_module::store::Offered {
+            account: serde_json::from_value(v["account"].clone()).unwrap(),
+            serial: rig.emu.serial(),
+            master_key_id: "11".repeat(32),
+            key: v["key"].as_str().unwrap().into(),
+        })
+        .collect();
+    other
+        .put_identified(theirs, &"11".repeat(32), &rig.emu.serial())
+        .unwrap();
+    shell.set_store(other);
+    let listed = shell.accounts().unwrap();
+    assert_eq!(listed[0].seed.as_deref(), Some("11".repeat(32).as_str()));
+    assert!(
+        !listed[0].available,
+        "the connected Shell is verified to hold {:?}",
+        added[0].seed
     );
 }
