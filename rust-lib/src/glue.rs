@@ -12,6 +12,7 @@ use serde_json::json;
 use crate::link;
 use crate::signer::{AddRequest, Events, ShellSigner};
 use crate::store::Store;
+use logos_signer_interface::wallets::{read_data_key, DataKey, DataKeyRequest};
 
 pub trait KeycardShellModule: Send + Sync + 'static {
     // ── logos.signer/1 ──────────────────────────────────────────────────
@@ -90,6 +91,71 @@ impl Events for Emit {
             "disconnected"
         });
     }
+}
+
+/// A seed's wallet opens with this module's key for it, which the signer manager gives once the
+/// person unlocks it in the Signer app, and closes when it locks. Asked from threads of their own,
+/// never while answering the manager, which would wait on itself.
+fn watch_wallets(shell: ShellSigner) {
+    let mut client = wallets::WalletsClient::bind(WALLETS);
+    let changed = client.on_wallets_changed();
+    let locked = client.on_wallets_locked();
+    let s = shell.clone();
+    std::thread::spawn(move || {
+        open_wallets(&s);
+        if let Ok(sub) = changed {
+            for _ in sub {
+                open_wallets(&s);
+            }
+        }
+    });
+    if let Ok(sub) = locked {
+        std::thread::spawn(move || {
+            for _ in sub {
+                shell.lock_seeds();
+                // Only some may have locked.
+                open_wallets(&shell);
+            }
+        });
+    }
+}
+
+/// Every closed seed's key; a locked one answers `locked` and stays closed.
+fn open_wallets(shell: &ShellSigner) {
+    for (seed, sealed_under) in shell.closed_seeds() {
+        let Some(current) = data_key(&seed, None) else {
+            continue;
+        };
+        let box_key = match sealed_under {
+            Some(g) if g != current.generation => match data_key(&seed, Some(g)) {
+                Some(k) => k,
+                None => continue,
+            },
+            _ => current.clone(),
+        };
+        if let Err(e) = shell.open_seed(&seed, &box_key, &current) {
+            eprintln!("keycard_shell_module: a wallet didn't open: {e}");
+        }
+    }
+}
+
+/// The key for a seed's document, named by its master key id, as the manager knows it.
+fn data_key(seed: &str, generation: Option<u32>) -> Option<DataKey> {
+    let body = serde_json::to_string(&DataKeyRequest {
+        seed: seed.to_string(),
+        scope: "accounts".into(),
+        generation,
+    })
+    .ok()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    wallets::WalletsClient::bind(WALLETS).data_key_async_with_timeout(
+        &body,
+        Duration::from_secs(10),
+        move |r| {
+            let _ = tx.send(r);
+        },
+    );
+    read_data_key(&rx.recv().ok()?.ok()?).ok()
 }
 
 struct KeycardShellModuleImpl {
@@ -307,7 +373,10 @@ impl KeycardShellModule for KeycardShellModuleImpl {
     fn on_context_ready(&self, ctx: &RustModuleContext) {
         // The accounts offered live in the module's own directory.
         match Store::open(&ctx.instance_persistence_path) {
-            Ok(store) => self.shell.set_store(store),
+            Ok(store) => {
+                self.shell.set_store(store);
+                watch_wallets(self.shell.clone());
+            }
             Err(e) => eprintln!(
                 "keycard_shell_module: {}: {e}",
                 ctx.instance_persistence_path

@@ -46,7 +46,13 @@ key on the Shell before it is exported:
   confirmations per Bitcoin account. The id is `shell-<fingerprint>-<purpose>-<coin>-<account>`,
   such as `shell-73c5da0a-84-1-0`.
 
-They are kept in `accounts.json` in the module's own directory. An account is `available` while a
+They are kept in `accounts.sealed.json` in the module's own directory, one document per seed, named
+by its master key id: its accounts, its name and the Shells that hold it. Each is sealed under the
+module's key for that seed, `data_key({ seed: <master key id>, scope: "accounts" })` from the signer
+manager ([logos.wallets/1](https://github.com/logos-co/logos-signer-interface/blob/main/docs/wallets.md)),
+asked for when `wallets_changed` says a wallet unlocked, and written at 0600. While a seed is locked
+nothing of its wallet is shown or offered; an account added meanwhile waits in memory and joins it
+when it unlocks. An account is `available` while a
 Shell that may hold its seed is connected: the Shell it came from, or one not yet verified, but not
 a Shell whose connection is verified to hold another seed. The module looks for Shells every second and a half, announces a
 change with `signer_changed` and `signer_accounts_changed`, and keeps every account listed either way.

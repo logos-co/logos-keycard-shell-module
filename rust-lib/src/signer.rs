@@ -12,6 +12,7 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::Psbt;
 use logos_signer_interface::jobs::{JobTable, KeyJobs};
 use logos_signer_interface::unlock::{evm_path_ok, is_reserved, roster_key, PURPOSE};
+use logos_signer_interface::wallets::DataKey;
 use logos_signer_interface::{
     Account, Chain, Collects, ErrorCode, Family, JobState, JobStatus, Payload, RequestKind, Secret,
     SignRequest, Signature, Signer, SignerError, SignerInfo, UnlockKey, UnlockKeyRequest,
@@ -802,6 +803,38 @@ impl ShellSigner {
         self.s
             .events
             .accounts_changed(lock(&self.s.store).list().len());
+    }
+
+    /// The seeds whose wallets wait for their key from the signer manager, each with the
+    /// generation its document is sealed under.
+    pub fn closed_seeds(&self) -> Vec<(String, Option<u32>)> {
+        lock(&self.s.store).closed()
+    }
+
+    /// A seed's key arrived: its wallet and accounts are shown.
+    pub fn open_seed(
+        &self,
+        seed: &str,
+        box_key: &DataKey,
+        current: &DataKey,
+    ) -> std::io::Result<()> {
+        let count = {
+            let mut store = lock(&self.s.store);
+            store.unlock(seed, box_key, current)?;
+            store.list().len()
+        };
+        self.s.events.accounts_changed(count);
+        Ok(())
+    }
+
+    /// Wallets were locked: nothing of theirs is shown or offered.
+    pub fn lock_seeds(&self) {
+        let count = {
+            let mut store = lock(&self.s.store);
+            store.lock();
+            store.list().len()
+        };
+        self.s.events.accounts_changed(count);
     }
 
     pub fn devices(&self) -> Vec<Device> {

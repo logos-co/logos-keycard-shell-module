@@ -1,10 +1,15 @@
-//! The accounts offered, kept in the module's own directory as `accounts.json`: public material
-//! and the serial of the Shell each came from, nothing else.
+//! The accounts offered, kept in the module's own directory as `accounts.sealed.json`: one
+//! document per seed (its accounts, its name, the Shells that hold it), sealed under the module's
+//! key for that seed from the signer manager and read only while it is unlocked. Public material
+//! and the serial of the Shell each came from, nothing else. An account of no verified seed is
+//! kept in memory only.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use logos_signer_interface::Account;
+use logos_signer_interface::sealed::SealedDocs;
+use logos_signer_interface::wallets::DataKey;
+use logos_signer_interface::{Account, SignerError};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -20,20 +25,52 @@ pub struct Offered {
     pub master_key_id: String,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
-struct File {
+/// One seed's document.
+#[derive(Default, Serialize, Deserialize)]
+struct Wallet {
     accounts: Vec<Offered>,
     #[serde(default)]
-    wallet_names: BTreeMap<String, String>,
+    name: String,
     #[serde(default)]
-    aliases: BTreeMap<String, Vec<String>>,
+    aliases: Vec<String>,
     #[serde(default)]
-    connections: BTreeMap<String, Vec<String>>,
+    connections: Vec<String>,
 }
 
-#[derive(Clone, Default)]
+/// What the sealed documents are called in their boxes.
+const WALLETS: &str = "keycard_shell_module wallets";
+
+fn io(e: SignerError) -> std::io::Error {
+    std::io::Error::other(e.message)
+}
+
 pub struct Store {
-    path: Option<PathBuf>,
+    /// Each seed's document, by master key id; the readable ones are in the fields below.
+    docs: SealedDocs,
+    offered: Vec<Offered>,
+    wallet_names: BTreeMap<String, String>,
+    aliases: BTreeMap<String, Vec<String>>,
+    connections: BTreeMap<String, Vec<String>>,
+    /// Added while their seed was locked, with the Shell they came through: merged in, and saved,
+    /// once it unlocks.
+    waiting: BTreeMap<String, (Vec<Offered>, Vec<String>)>,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Store {
+            docs: SealedDocs::in_memory(WALLETS),
+            offered: Vec::new(),
+            wallet_names: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            connections: BTreeMap::new(),
+            waiting: BTreeMap::new(),
+        }
+    }
+}
+
+/// The state that rolls back when a write fails.
+struct Snapshot {
     offered: Vec<Offered>,
     wallet_names: BTreeMap<String, String>,
     aliases: BTreeMap<String, Vec<String>>,
@@ -46,24 +83,108 @@ impl Store {
         Store::default()
     }
 
-    /// Read `dir/accounts.json`, kept there from now on. A missing file is an empty list.
+    /// Read `dir/accounts.sealed.json`, kept there from now on. A missing file is an empty list.
+    /// Each seed's document stays sealed until its key arrives ([`Store::unlock`]).
     pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
-        let path = dir.into().join("accounts.json");
-        let mut file = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<File>(&bytes)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => File::default(),
-            Err(e) => return Err(e),
-        };
-        for o in &file.accounts {
-            file.wallet_names.entry(wallet_id(o)).or_default();
-        }
+        let docs =
+            SealedDocs::load(dir.into().join("accounts.sealed.json"), WALLETS).map_err(io)?;
         Ok(Store {
-            path: Some(path),
-            offered: file.accounts,
-            wallet_names: file.wallet_names,
-            aliases: file.aliases,
-            connections: file.connections,
+            docs,
+            ..Store::default()
         })
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            offered: self.offered.clone(),
+            wallet_names: self.wallet_names.clone(),
+            aliases: self.aliases.clone(),
+            connections: self.connections.clone(),
+        }
+    }
+
+    fn restore(&mut self, s: Snapshot) {
+        self.offered = s.offered;
+        self.wallet_names = s.wallet_names;
+        self.aliases = s.aliases;
+        self.connections = s.connections;
+    }
+
+    /// Sealed, and its key not given yet.
+    fn is_locked(&self, seed: &str) -> bool {
+        self.docs.wanted(seed).is_some()
+    }
+
+    /// The seeds whose documents wait for their key, each with the generation it is sealed
+    /// under, if it is sealed yet.
+    pub fn closed(&self) -> Vec<(String, Option<u32>)> {
+        let mut out: Vec<(String, Option<u32>)> = self
+            .docs
+            .seeds()
+            .into_iter()
+            .filter(|s| !self.docs.is_open(s))
+            .map(|s| {
+                let g = self.docs.wanted(&s);
+                (s, g)
+            })
+            .collect();
+        for seed in self.waiting.keys() {
+            if !out.iter().any(|(s, _)| s == seed) {
+                out.push((seed.clone(), None));
+            }
+        }
+        out
+    }
+
+    /// A seed's key arrived: its wallet is shown again, with what was added meanwhile.
+    pub fn unlock(
+        &mut self,
+        seed: &str,
+        box_key: &DataKey,
+        current: &DataKey,
+    ) -> std::io::Result<()> {
+        self.docs.unlock(seed, box_key, current).map_err(io)?;
+        let doc: Wallet = self
+            .docs
+            .get(seed)
+            .filter(|b| !b.is_empty())
+            .map(serde_json::from_slice)
+            .transpose()?
+            .unwrap_or_default();
+        let id = format!("seed:{seed}");
+        self.offered.retain(|o| o.master_key_id != seed);
+        self.offered.extend(doc.accounts);
+        self.wallet_names.insert(id.clone(), doc.name);
+        self.aliases.remove(&id);
+        if !doc.aliases.is_empty() {
+            self.aliases.insert(id.clone(), doc.aliases);
+        }
+        self.connections.insert(id.clone(), doc.connections);
+        if let Some((add, serials)) = self.waiting.remove(seed) {
+            let connections = self.connections.entry(id).or_default();
+            for serial in serials {
+                if !connections.contains(&serial) {
+                    connections.push(serial);
+                }
+            }
+            self.merge(add);
+        }
+        self.save()
+    }
+
+    /// Wallets were locked: nothing of a locked seed is shown. What waits for its key stays.
+    pub fn lock(&mut self) {
+        self.docs.lock();
+        let readable: Vec<String> = self.docs.readable().into_iter().map(|(s, _)| s).collect();
+        let shown = |id: &String| {
+            id.strip_prefix("seed:")
+                .is_none_or(|seed| readable.iter().any(|r| r == seed))
+        };
+        self.offered
+            .retain(|o| o.master_key_id.is_empty() || readable.contains(&o.master_key_id));
+        self.wallet_names.retain(|id, _| shown(id));
+        self.aliases.retain(|id, _| shown(id));
+        self.connections.retain(|id, _| shown(id));
     }
 
     pub fn list(&self) -> &[Offered] {
@@ -82,7 +203,18 @@ impl Store {
         serial: &str,
     ) -> std::io::Result<()> {
         self.check_keys(&add)?;
-        let previous = self.clone();
+        if self.is_locked(root) {
+            let (accounts, serials) = self.waiting.entry(root.into()).or_default();
+            for o in add {
+                accounts.retain(|have| !same(&have.account, &o.account.id));
+                accounts.push(o);
+            }
+            if !serials.iter().any(|s| s == serial) {
+                serials.push(serial.into());
+            }
+            return Ok(());
+        }
+        let previous = self.snapshot();
         let id = format!("seed:{root}");
         self.wallet_names.entry(id.clone()).or_default();
         let connections = self.connections.entry(id).or_default();
@@ -91,7 +223,7 @@ impl Store {
         }
         self.merge(add);
         if let Err(e) = self.save() {
-            *self = previous;
+            self.restore(previous);
             return Err(e);
         }
         Ok(())
@@ -99,10 +231,17 @@ impl Store {
 
     pub fn put(&mut self, add: Vec<Offered>) -> std::io::Result<()> {
         self.check_keys(&add)?;
-        let previous = self.clone();
+        if let Some(locked) = add.iter().find(|o| self.is_locked(&o.master_key_id)) {
+            return self.put_identified(
+                add.clone(),
+                &locked.master_key_id.clone(),
+                &locked.serial.clone(),
+            );
+        }
+        let previous = self.snapshot();
         self.merge(add);
         if let Err(e) = self.save() {
-            *self = previous;
+            self.restore(previous);
             return Err(e);
         }
         Ok(())
@@ -242,34 +381,59 @@ impl Store {
         if !self.wallet_names.contains_key(id) {
             return Err(std::io::Error::other("Unknown wallet"));
         }
-        let previous = self.clone();
+        let previous = self.snapshot();
         self.offered.retain(|o| wallet_id(o) != id);
         self.wallet_names.remove(id);
         self.aliases.remove(id);
         self.connections.remove(id);
         if let Err(e) = self.save() {
-            *self = previous;
+            self.restore(previous);
             return Err(e);
+        }
+        if let Some(seed) = id.strip_prefix("seed:") {
+            self.waiting.remove(seed);
         }
         Ok(())
     }
 
-    fn save(&self) -> std::io::Result<()> {
-        let Some(path) = &self.path else {
-            return Ok(());
-        };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+    /// Each shown seed's document, sealed under its key, or kept in memory until it comes.
+    fn save(&mut self) -> std::io::Result<()> {
+        let mut docs: BTreeMap<String, Wallet> = BTreeMap::new();
+        for id in self.wallet_names.keys() {
+            if let Some(seed) = id.strip_prefix("seed:") {
+                docs.insert(
+                    seed.into(),
+                    Wallet {
+                        accounts: Vec::new(),
+                        name: self.wallet_name(id),
+                        aliases: self.aliases(id),
+                        connections: self.connections(id),
+                    },
+                );
+            }
         }
-        let body = serde_json::to_vec_pretty(&File {
-            accounts: self.offered.clone(),
-            wallet_names: self.wallet_names.clone(),
-            aliases: self.aliases.clone(),
-            connections: self.connections.clone(),
-        })?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, body)?;
-        std::fs::rename(tmp, path)
+        for o in self.offered.iter().filter(|o| !o.master_key_id.is_empty()) {
+            docs.entry(o.master_key_id.clone())
+                .or_default()
+                .accounts
+                .push(o.clone());
+        }
+        let gone: Vec<String> = self
+            .docs
+            .readable()
+            .into_iter()
+            .map(|(seed, _)| seed)
+            .filter(|seed| !docs.contains_key(seed))
+            .collect();
+        for seed in gone {
+            self.docs.remove(&seed).map_err(io)?;
+        }
+        for (seed, doc) in docs {
+            self.docs
+                .put(&seed, serde_json::to_vec(&doc)?)
+                .map_err(io)?;
+        }
+        Ok(())
     }
 }
 

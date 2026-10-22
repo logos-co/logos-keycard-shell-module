@@ -64,6 +64,29 @@ struct Rig {
     forbid_public: Arc<AtomicBool>,
 }
 
+fn key(byte: u8) -> logos_signer_interface::wallets::DataKey {
+    logos_signer_interface::wallets::DataKey {
+        key: Secret::new(hex::encode([byte; 32])),
+        generation: 0,
+    }
+}
+
+/// The store kept in `dir`, every seed in it unlocked.
+fn unlocked(dir: &std::path::Path) -> Store {
+    let mut store = Store::open(dir).unwrap();
+    for (seed, _) in store.closed() {
+        store.unlock(&seed, &key(1), &key(1)).unwrap();
+    }
+    store
+}
+
+/// `rig`'s seeds unlocked, as the signer manager's key would.
+fn unlock_all(rig: &Rig) {
+    for (seed, _) in rig.shell.closed_seeds() {
+        rig.shell.open_seed(&seed, &key(1), &key(1)).unwrap();
+    }
+}
+
 fn rig_with(store: Store) -> Rig {
     let emu = Emulator::new(PHRASE, Confirm::Manual);
     let addr = emu.listen().unwrap();
@@ -364,8 +387,23 @@ fn its_accounts_are_kept_and_can_be_removed() {
     let _ = std::fs::remove_dir_all(&dir);
     let rig = rig_with(Store::open(&dir).unwrap());
     let added = add(&rig, vec![Family::Evm, Family::BitcoinTaproot], Chain::Test);
+    unlock_all(&rig);
     drop(rig);
-    let mut again = rig_with(Store::open(&dir).unwrap());
+    let mut locked = rig_with(Store::open(&dir).unwrap());
+    assert!(
+        locked.shell.accounts().unwrap().is_empty(),
+        "none offered while locked"
+    );
+    let more = add(&locked, vec![Family::Bitcoin], Chain::Test);
+    assert!(
+        locked.shell.accounts().unwrap().is_empty(),
+        "one added while locked waits for the key"
+    );
+    unlock_all(&locked);
+    assert_eq!(locked.shell.accounts().unwrap().len(), 3);
+    assert!(locked.shell.remove_account(&more[0].id).unwrap());
+    drop(locked);
+    let mut again = rig_with(unlocked(&dir));
     let listed = again.shell.accounts().unwrap();
     assert_eq!(
         listed.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
@@ -373,10 +411,13 @@ fn its_accounts_are_kept_and_can_be_removed() {
     );
     assert!(again.shell.remove_account(&added[1].id).unwrap());
     assert_eq!(again.shell.accounts().unwrap().len(), 1);
-    let kept = std::fs::read_to_string(dir.join("accounts.json")).unwrap();
+    let kept = std::fs::read_to_string(dir.join("accounts.sealed.json")).unwrap();
+    for public in [&added[0].id, &added[1].id] {
+        assert!(!kept.contains(public.as_str()), "{kept}");
+    }
     assert!(
-        !kept.contains("xprv") && !kept.contains("tprv"),
-        "public material only"
+        !kept.contains("pub") && !kept.contains("prv") && !kept.contains(&again.emu.serial()),
+        "{kept}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -545,13 +586,14 @@ fn wallet_names_and_empty_wallets_survive_reload() {
         .to_owned();
     rig.shell.rename_wallet(&id, "Travel").unwrap();
     rig.shell.remove_account(&account.id).unwrap();
-    let restored = rig_with(Store::open(&dir).unwrap());
+    unlock_all(&rig);
+    let restored = rig_with(unlocked(&dir));
     let groups = restored.shell.wallet_groups();
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0]["name"], "Travel");
     assert!(groups[0]["accounts"].as_array().unwrap().is_empty());
     restored.shell.forget_wallet(&id).unwrap();
-    assert!(Store::open(&dir).unwrap().wallet_names().is_empty());
+    assert!(Store::open(&dir).unwrap().closed().is_empty());
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -560,20 +602,14 @@ fn account_renaming_persists_without_changing_keys_and_rolls_back_on_write_failu
     let dir = std::env::temp_dir().join(format!("shell-account-name-{}", std::process::id()));
     let rig = rig_with(Store::open(&dir).unwrap());
     let account = add(&rig, vec![Family::Evm], Chain::Main).remove(0);
-    let original = Store::open(&dir)
-        .unwrap()
-        .find(&account.id)
-        .unwrap()
-        .clone();
+    unlock_all(&rig);
+    let original = unlocked(&dir).find(&account.id).unwrap().clone();
     rig.shell
         .rename_account(&account.id.to_uppercase(), "  Travel ETH  ")
         .unwrap();
     let mut expected = original.clone();
     expected.account.label = Some("Travel ETH".into());
-    assert_eq!(
-        Store::open(&dir).unwrap().find(&account.id),
-        Some(&expected)
-    );
+    assert_eq!(unlocked(&dir).find(&account.id), Some(&expected));
     assert_eq!(
         rig.shell.wallet_groups()[0]["accounts"][0]["label"],
         "Travel ETH"
@@ -586,10 +622,7 @@ fn account_renaming_persists_without_changing_keys_and_rolls_back_on_write_failu
     assert!(rig.shell.rename_account(&account.id, "bad\nname").is_err());
     rig.shell.rename_account(&account.id, " ").unwrap();
     expected.account.label = None;
-    assert_eq!(
-        Store::open(&dir).unwrap().find(&account.id),
-        Some(&expected)
-    );
+    assert_eq!(unlocked(&dir).find(&account.id), Some(&expected));
     std::fs::remove_dir_all(&dir).unwrap();
     std::fs::write(&dir, "not a directory").unwrap();
     assert!(rig.shell.rename_account(&account.id, "Unsaved").is_err());
@@ -602,13 +635,10 @@ fn legacy_wallet_migration_preserves_names_and_verifies_each_full_account_key() 
     let dir = std::env::temp_dir().join(format!("shell-seed-migrate-{}", std::process::id()));
     let rig = rig_with(Store::open(&dir).unwrap());
     let account = add(&rig, vec![Family::Evm], Chain::Main).remove(0);
-    let mut old = Store::open(&dir)
-        .unwrap()
-        .find(&account.id)
-        .unwrap()
-        .clone();
+    unlock_all(&rig);
+    let mut old = unlocked(&dir).find(&account.id).unwrap().clone();
     let root = old.master_key_id.clone();
-    let mut guarded = Store::open(&dir).unwrap();
+    let mut guarded = unlocked(&dir);
     let original = old.clone();
     let mut wrong_key = old.clone();
     wrong_key.key = "other full public key".into();
