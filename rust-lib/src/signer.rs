@@ -989,9 +989,24 @@ impl ShellSigner {
                     "id": id, "name": name, "aliases": store.aliases(id), "transport": "shell",
                     "serial": serials.iter().find(|s| connected.contains(s)).or(serials.first()),
                     "connections": connections, "identified": id.starts_with("seed:"),
-                    "connected": serials.iter().any(|s| connected.contains(s)), "accounts": []
+                    "connected": serials.iter().any(|s| connected.contains(s)), "accounts": [],
+                    "locked": false
                 }),
             );
+        }
+        // A wallet sealed until the person unlocks it in the Signer app: its name and accounts
+        // are in its sealed document, so only that it is there shows.
+        for (seed, sealed) in store.closed() {
+            if sealed.is_some() {
+                let id = format!("seed:{seed}");
+                groups.entry(id.clone()).or_insert_with(|| {
+                    serde_json::json!({
+                        "id": id, "name": "", "aliases": [], "transport": "shell", "serial": null,
+                        "connections": [], "identified": true, "connected": false, "accounts": [],
+                        "locked": true
+                    })
+                });
+            }
         }
         for o in store.list() {
             let id = crate::store::wallet_id(o);

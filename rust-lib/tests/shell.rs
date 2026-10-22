@@ -390,6 +390,12 @@ fn its_accounts_are_kept_and_can_be_removed() {
     unlock_all(&rig);
     drop(rig);
     let mut locked = rig_with(Store::open(&dir).unwrap());
+    let groups = locked.shell.wallet_groups();
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    assert_eq!(
+        (groups[0]["locked"].clone(), groups[0]["name"].clone()),
+        (serde_json::json!(true), serde_json::json!(""))
+    );
     assert!(
         locked.shell.accounts().unwrap().is_empty(),
         "none offered while locked"

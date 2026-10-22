@@ -52,7 +52,8 @@ module's key for that seed, `data_key({ seed: <master key id>, scope: "accounts"
 manager ([logos.wallets/1](https://github.com/logos-co/logos-signer-interface/blob/main/docs/wallets.md)),
 asked for when `wallets_changed` says a wallet unlocked, and written at 0600. While a seed is locked
 nothing of its wallet is shown or offered; an account added meanwhile waits in memory and joins it
-when it unlocks. An account is `available` while a
+when it unlocks. `wallet_groups` lists such a wallet as `locked`, with no name and no accounts, so
+the app can say why. An account is `available` while a
 Shell that may hold its seed is connected: the Shell it came from, or one not yet verified, but not
 a Shell whose connection is verified to hold another seed. The module looks for Shells every second and a half, announces a
 change with `signer_changed` and `signer_accounts_changed`, and keeps every account listed either way.
