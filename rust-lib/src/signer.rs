@@ -589,10 +589,8 @@ impl Shared {
             }
         }
         for family in &req.families {
-            let label = req
-                .label
-                .clone()
-                .or_else(|| Some(default_label(*family, req.chain)));
+            // Its own name only: an unnamed account shows as its kind and address, not a stored default.
+            let label = req.label.clone().filter(|l| !l.trim().is_empty());
             let offered = match family {
                 Family::Evm => {
                     let mut path = accounts::EVM_PATH;
@@ -655,20 +653,6 @@ impl Shared {
 /// Same encoding as the Keycard applet's key UID (EC getW, SEC1 uncompressed).
 fn master_id(key: &PublicKey) -> String {
     sha256::Hash::hash(&key.serialize_uncompressed()).to_string()
-}
-
-fn default_label(family: Family, chain: Chain) -> String {
-    let what = match family {
-        Family::Evm => "EVM",
-        Family::Bitcoin => "native segwit",
-        Family::BitcoinTaproot => "taproot",
-    };
-    let test = if family != Family::Evm && chain == Chain::Test {
-        " (test)"
-    } else {
-        ""
-    };
-    format!("Keycard Shell {what}{test}")
 }
 
 /// The module's state, shared with the jobs it runs.

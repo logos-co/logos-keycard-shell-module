@@ -146,7 +146,10 @@ fn add(rig: &Rig, families: Vec<Family>, chain: Chain) -> Vec<Account> {
         Some(a) if a.state == "failed" => panic!("{:?}", a.error),
         _ => false,
     });
-    out.unwrap()
+    let got = out.unwrap();
+    // Unnamed, an account keeps no name: apps show its kind and address.
+    assert!(got.iter().all(|a| a.label.is_none()), "{got:?}");
+    got
 }
 
 fn settle(rig: &mut Rig, job: &str, yes: bool) -> JobStatus {
