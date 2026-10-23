@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::PublicKey;
@@ -50,6 +50,7 @@ impl Events for Quiet {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AddRequest {
+    #[serde(default)]
     pub families: Vec<Family>,
     #[serde(default = "test_chain")]
     pub chain: Chain,
@@ -57,6 +58,15 @@ pub struct AddRequest {
     pub account: u32,
     #[serde(default)]
     pub label: Option<String>,
+    /// Several accounts at once, each its own; instead of `families`, `account` and `label`.
+    #[serde(default)]
+    pub entries: Vec<AddEntry>,
+    /// Export the accounts to show them, and keep none yet.
+    #[serde(default)]
+    pub preview: bool,
+    /// Keep accounts `entries` picks from this session's recent previews, with no Shell access.
+    #[serde(default)]
+    pub from_preview: bool,
     /// Which Shell, when more than one is connected.
     #[serde(default)]
     pub serial: Option<String>,
@@ -69,6 +79,93 @@ pub struct AddRequest {
     /// Explicitly re-check the connection without importing or regrouping accounts.
     #[serde(default)]
     pub verify_only: bool,
+}
+
+/// One account to add: its family, index, network (the request's when absent) and own name.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AddEntry {
+    pub family: Family,
+    #[serde(default)]
+    pub account: u32,
+    #[serde(default)]
+    pub chain: Option<Chain>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// The most accounts one add exports.
+pub const MAX_ADD: usize = 20;
+
+/// How long a preview's export can be kept from, and how many previews are held.
+const PREVIEW_TTL: Duration = Duration::from_secs(15 * 60);
+const PREVIEWS: usize = 10;
+
+/// A preview's export, held so an add keeps from it without asking the Shell again.
+struct Preview {
+    at: Instant,
+    offered: Vec<Offered>,
+    unlock_key: Option<[u8; 33]>,
+}
+
+/// Where an entry's account sits.
+fn entry_path(e: &AddEntry, chain: Chain) -> Result<String, SignerError> {
+    match e.family {
+        Family::Evm => {
+            let mut path = accounts::EVM_PATH;
+            path[4] = e.account;
+            Ok(accounts::path_string(&path))
+        }
+        _ => accounts::bitcoin_path(e.family, e.chain.unwrap_or(chain), e.account)
+            .map(|p| accounts::path_string(&p))
+            .ok_or_else(|| err(ErrorCode::Invalid, "account index")),
+    }
+}
+
+/// The accounts an export shows, each naming its seed.
+fn shown(offered: &[Offered], root: &str) -> Vec<Account> {
+    offered
+        .iter()
+        .map(|o| Account {
+            seed: Some(root.to_string()),
+            ..o.account.clone()
+        })
+        .collect()
+}
+
+impl AddRequest {
+    /// The accounts asked for: `entries`, or each of `families` at `account`.
+    pub fn wanted(&self) -> Result<Vec<AddEntry>, SignerError> {
+        if !self.entries.is_empty() && !self.families.is_empty() {
+            return Err(err(
+                ErrorCode::Invalid,
+                "name families or entries, not both",
+            ));
+        }
+        let out: Vec<AddEntry> = if self.entries.is_empty() {
+            self.families
+                .iter()
+                .map(|f| AddEntry {
+                    family: *f,
+                    account: self.account,
+                    chain: None,
+                    label: self.label.clone(),
+                })
+                .collect()
+        } else {
+            self.entries.clone()
+        };
+        if out.len() > MAX_ADD {
+            return Err(err(
+                ErrorCode::Invalid,
+                format!("at most {MAX_ADD} accounts at once"),
+            ));
+        }
+        if out.iter().any(|e| e.account >= HARDENED) {
+            return Err(err(ErrorCode::Invalid, "account index out of range"));
+        }
+        Ok(out)
+    }
 }
 
 fn test_chain() -> Chain {
@@ -114,6 +211,7 @@ struct Shared {
     /// Unlock-key jobs: read once, by the manager only, and announced nowhere.
     keys: Mutex<KeyJobs>,
     adds: Mutex<HashMap<String, Added>>,
+    previews: Mutex<Vec<Preview>>,
     connected: Mutex<Vec<String>>,
     sessions: Mutex<HashMap<String, ConnectionSession>>,
     busy: AtomicBool,
@@ -318,6 +416,41 @@ fn name_internal_keys(psbt: &mut Psbt, fingerprint: [u8; 4]) -> Result<(), Signe
 type Exported = (Vec<Offered>, String, Option<[u8; 33]>);
 
 impl Shared {
+    /// Keep exported accounts under their root, and register the seed with its unlock key.
+    fn keep(
+        &self,
+        offered: Vec<Offered>,
+        root: &str,
+        serial: &str,
+        unlock_key: Option<[u8; 33]>,
+    ) -> Result<Vec<Account>, SignerError> {
+        let accounts = shown(&offered, root);
+        lock(&self.store)
+            .put_identified(offered, root, serial)
+            .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
+        // The wallet's own name, never an account's.
+        let name = Some(lock(&self.store).wallet_name(&format!("seed:{root}")))
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| "Keycard Shell".into());
+        self.events.seed_added(root, unlock_key, &name);
+        self.events.accounts_changed(lock(&self.store).list().len());
+        Ok(accounts)
+    }
+
+    /// Hold a preview's export, dropping old ones.
+    fn hold_preview(&self, offered: Vec<Offered>, unlock_key: Option<[u8; 33]>) {
+        let mut held = lock(&self.previews);
+        held.retain(|p| p.at.elapsed() < PREVIEW_TTL);
+        if held.len() >= PREVIEWS {
+            held.remove(0);
+        }
+        held.push(Preview {
+            at: Instant::now(),
+            offered,
+            unlock_key,
+        });
+    }
+
     fn refresh_connected(&self) {
         // Serialize enumeration and cache updates so an older poll cannot restore a session.
         let mut sessions = lock(&self.sessions);
@@ -568,6 +701,7 @@ impl Shared {
         let legacy: Vec<_> = lock(&self.store)
             .list()
             .iter()
+            .filter(|_| !req.preview)
             .filter(|o| {
                 o.serial == serial
                     && o.master_key_id.is_empty()
@@ -588,13 +722,18 @@ impl Shared {
                 out.push(o);
             }
         }
-        for family in &req.families {
+        for entry in req.wanted()? {
+            let (family, chain, index) = (
+                &entry.family,
+                entry.chain.unwrap_or(req.chain),
+                entry.account,
+            );
             // Its own name only: an unnamed account shows as its kind and address, not a stored default.
-            let label = req.label.clone().filter(|l| !l.trim().is_empty());
+            let label = entry.label.clone().filter(|l| !l.trim().is_empty());
             let offered = match family {
                 Family::Evm => {
                     let mut path = accounts::EVM_PATH;
-                    path[4] = req.account;
+                    path[4] = index;
                     let e = commands::get_public(t, &path, false).map_err(shell)?;
                     let mut account = accounts::evm_account(&e, label);
                     account.path = Some(accounts::path_string(&path));
@@ -606,19 +745,13 @@ impl Shared {
                     }
                 }
                 Family::Bitcoin | Family::BitcoinTaproot => {
-                    let path = accounts::bitcoin_path(*family, req.chain, req.account)
+                    let path = accounts::bitcoin_path(*family, chain, index)
                         .ok_or_else(|| err(ErrorCode::Invalid, "account index"))?;
                     let parent = commands::get_public(t, &path[..2], true).map_err(shell)?;
                     let key = commands::get_public(t, &path, true).map_err(shell)?;
-                    let account = accounts::bitcoin_account(
-                        &parent,
-                        &key,
-                        *family,
-                        req.chain,
-                        req.account,
-                        label,
-                    )
-                    .map_err(|e| err(ErrorCode::Internal, e))?;
+                    let account =
+                        accounts::bitcoin_account(&parent, &key, *family, chain, index, label)
+                            .map_err(|e| err(ErrorCode::Internal, e))?;
                     Offered {
                         account,
                         serial: serial.into(),
@@ -639,9 +772,14 @@ impl Shared {
         }
         // One more confirmation: the seed's unlock key, so adding never asks twice. A Shell that
         // won't export it still adds; its wallet then unlocks by a password.
-        let unlock_key = commands::get_public(t, &[HARDENED | PURPOSE, HARDENED], false)
-            .ok()
-            .map(|k| k.key.serialize());
+        // A preview of a wallet kept here already needs none: keeping from it registers nothing new.
+        let unlock_key = if req.preview && lock(&self.store).knows(&root_id) {
+            None
+        } else {
+            commands::get_public(t, &[HARDENED | PURPOSE, HARDENED], false)
+                .ok()
+                .map(|k| k.key.serialize())
+        };
         Ok((out, root_id, unlock_key))
     }
 
@@ -751,6 +889,7 @@ impl ShellSigner {
             jobs: Mutex::new(JobTable::new()),
             keys: Mutex::new(KeyJobs::new()),
             adds: Mutex::new(HashMap::new()),
+            previews: Mutex::new(Vec::new()),
             connected: Mutex::new(Vec::new()),
             sessions: Mutex::new(HashMap::new()),
             busy: AtomicBool::new(false),
@@ -858,17 +997,24 @@ impl ShellSigner {
 
     /// Export the requested accounts from a connected Shell, each confirmed on it: a job id.
     pub fn add_accounts(&self, req: AddRequest) -> Result<String, SignerError> {
-        if req.verify_only && (!req.families.is_empty() || req.identify) {
+        let wanted = req.wanted()?;
+        if req.verify_only && (!wanted.is_empty() || req.identify) {
             return Err(err(
                 ErrorCode::Invalid,
                 "Verification cannot also add or identify accounts",
             ));
         }
-        if req.families.is_empty() && !req.identify && !req.verify_only {
+        if wanted.is_empty() && !req.identify && !req.verify_only {
             return Err(err(ErrorCode::Invalid, "name at least one family"));
         }
-        if req.account >= HARDENED {
-            return Err(err(ErrorCode::Invalid, "account index out of range"));
+        if (req.preview || req.from_preview) && (req.identify || req.verify_only) {
+            return Err(err(
+                ErrorCode::Invalid,
+                "A preview only shows accounts: it cannot identify or verify",
+            ));
+        }
+        if req.from_preview {
+            return self.keep_previewed(&req, &wanted);
         }
         let connected = lock(&self.s.connected).clone();
         let serial = match &req.serial {
@@ -907,24 +1053,14 @@ impl ShellSigner {
         std::thread::spawn(move || {
             let outcome = s.export(&serial, &req);
             let added = match outcome.and_then(|(offered, root, unlock_key)| {
-                let accounts = offered
-                    .iter()
-                    .map(|o| Account {
-                        seed: Some(root.clone()),
-                        ..o.account.clone()
-                    })
-                    .collect();
-                if !req.verify_only {
-                    lock(&s.store)
-                        .put_identified(offered, &root, &serial)
-                        .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
-                    let name = req
-                        .label
-                        .clone()
-                        .filter(|n| !n.trim().is_empty())
-                        .unwrap_or_else(|| "Keycard Shell".into());
-                    s.events.seed_added(&root, unlock_key, &name);
+                if req.verify_only {
+                    return Ok(shown(&offered, &root));
                 }
+                if !req.preview {
+                    return s.keep(offered, &root, &serial, unlock_key);
+                }
+                let accounts = shown(&offered, &root);
+                s.hold_preview(offered, unlock_key);
                 Ok(accounts)
             }) {
                 Ok(accounts) => Added {
@@ -939,7 +1075,7 @@ impl ShellSigner {
                 },
             };
             s.busy.store(false, Ordering::SeqCst);
-            let done = added.state == "done";
+            let done = added.state == "done" && req.verify_only;
             lock(&s.adds).insert(job, added);
             if done {
                 s.events.accounts_changed(lock(&s.store).list().len());
@@ -950,6 +1086,66 @@ impl ShellSigner {
 
     pub fn add_status(&self, job: &str) -> Option<Added> {
         lock(&self.s.adds).get(job).cloned()
+    }
+
+    /// Keep the accounts `entries` picks from recent previews, each with its own name, and
+    /// forget the previews. Every pick must come from one wallet; nothing touches the Shell.
+    fn keep_previewed(&self, req: &AddRequest, wanted: &[AddEntry]) -> Result<String, SignerError> {
+        if req.preview {
+            return Err(err(ErrorCode::Invalid, "a preview keeps nothing"));
+        }
+        let mut held = lock(&self.s.previews);
+        held.retain(|p| p.at.elapsed() < PREVIEW_TTL);
+        let mut offered: Vec<Offered> = Vec::new();
+        let mut unlock_key = None;
+        for e in wanted {
+            let path = entry_path(e, req.chain)?;
+            let (o, key) = held
+                .iter()
+                .rev()
+                .find_map(|p| {
+                    p.offered
+                        .iter()
+                        .find(|o| {
+                            o.account.family == e.family
+                                && o.account.path.as_deref() == Some(path.as_str())
+                        })
+                        .map(|o| (o, p.unlock_key))
+                })
+                .ok_or_else(|| {
+                    err(
+                        ErrorCode::Invalid,
+                        format!("no recent preview shows {path}: show the accounts again"),
+                    )
+                })?;
+            let mut o = o.clone();
+            o.account.label = e.label.clone().filter(|l| !l.trim().is_empty());
+            unlock_key = unlock_key.or(key);
+            offered.push(o);
+        }
+        if offered
+            .iter()
+            .any(|o| o.master_key_id != offered[0].master_key_id)
+        {
+            return Err(err(
+                ErrorCode::Invalid,
+                "these accounts come from different wallets",
+            ));
+        }
+        held.clear();
+        drop(held);
+        let (root, serial) = (offered[0].master_key_id.clone(), offered[0].serial.clone());
+        let accounts = self.s.keep(offered, &root, &serial, unlock_key)?;
+        let job = self.s.next_id("add");
+        lock(&self.s.adds).insert(
+            job.clone(),
+            Added {
+                state: "done",
+                accounts,
+                error: None,
+            },
+        );
+        Ok(job)
     }
 
     /// Root identity is independent of transport. Unverified legacy groups remain separate.

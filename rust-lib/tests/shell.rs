@@ -11,7 +11,7 @@ use keycard_shell_module::apdu::{self, ShellError, Transport};
 use keycard_shell_module::commands;
 use keycard_shell_module::emulator::{Confirm, Emulator, PHRASE};
 use keycard_shell_module::link::{Devices, Emulated};
-use keycard_shell_module::signer::{AddRequest, Quiet, ShellSigner};
+use keycard_shell_module::signer::{AddEntry, AddRequest, Quiet, ShellSigner};
 use keycard_shell_module::store::Store;
 use logos_signer_interface::conformance::{self, Fixture};
 use logos_signer_interface::verify::check;
@@ -123,20 +123,31 @@ fn answer_until(emu: &Emulator, yes: bool, mut done: impl FnMut() -> bool) {
 }
 
 fn add(rig: &Rig, families: Vec<Family>, chain: Chain) -> Vec<Account> {
-    let job = rig
-        .shell
-        .add_accounts(AddRequest {
+    let got = exported(
+        rig,
+        AddRequest {
             families,
             chain,
             account: 0,
             label: None,
+            entries: Vec::new(),
+            preview: false,
+            from_preview: false,
             serial: None,
             fingerprint: None,
             master_key_id: None,
             identify: false,
             verify_only: false,
-        })
-        .unwrap();
+        },
+    );
+    // Unnamed, an account keeps no name: apps show its kind and address.
+    assert!(got.iter().all(|a| a.label.is_none()), "{got:?}");
+    got
+}
+
+/// An export's accounts once it ends, every question answered yes.
+fn exported(rig: &Rig, req: AddRequest) -> Vec<Account> {
+    let job = rig.shell.add_accounts(req).unwrap();
     let mut out = None;
     answer_until(&rig.emu, true, || match rig.shell.add_status(&job) {
         Some(a) if a.state == "done" => {
@@ -146,10 +157,7 @@ fn add(rig: &Rig, families: Vec<Family>, chain: Chain) -> Vec<Account> {
         Some(a) if a.state == "failed" => panic!("{:?}", a.error),
         _ => false,
     });
-    let got = out.unwrap();
-    // Unnamed, an account keeps no name: apps show its kind and address.
-    assert!(got.iter().all(|a| a.label.is_none()), "{got:?}");
-    got
+    out.unwrap()
 }
 
 fn settle(rig: &mut Rig, job: &str, yes: bool) -> JobStatus {
@@ -362,6 +370,123 @@ fn one_request_at_a_time_and_a_cancelled_one_signs_nothing() {
 }
 
 #[test]
+fn accounts_a_preview_showed_are_kept_from_it_without_the_shell() {
+    let mut rig = rig_with(Store::new());
+    let request = |entries: Vec<AddEntry>, preview, from_preview| AddRequest {
+        families: Vec::new(),
+        chain: Chain::Main,
+        account: 0,
+        label: None,
+        entries,
+        preview,
+        from_preview,
+        serial: None,
+        fingerprint: None,
+        master_key_id: None,
+        identify: false,
+        verify_only: false,
+    };
+    let entry = |family, account, label: Option<&str>| AddEntry {
+        family,
+        account,
+        chain: None,
+        label: label.map(Into::into),
+    };
+    let page = exported(
+        &rig,
+        request(
+            (0..5).map(|i| entry(Family::Evm, i, None)).collect(),
+            true,
+            false,
+        ),
+    );
+    let btc = exported(
+        &rig,
+        request(vec![entry(Family::Bitcoin, 2, None)], true, false),
+    );
+
+    // Unplugged: keeping asks nothing of the Shell.
+    rig.on.store(false, Ordering::SeqCst);
+    rig.shell.refresh();
+    let keep = request(
+        vec![
+            entry(Family::Evm, 4, Some("Rent")),
+            entry(Family::Bitcoin, 2, None),
+        ],
+        false,
+        true,
+    );
+    let job = rig.shell.add_accounts(keep).unwrap();
+    let kept = rig.shell.add_status(&job).unwrap();
+    assert_eq!(kept.state, "done");
+    assert_eq!(kept.accounts[0].id, page[4].id);
+    assert_eq!(kept.accounts[0].label.as_deref(), Some("Rent"));
+    assert_eq!(kept.accounts[1].id, btc[0].id);
+    assert_eq!(rig.shell.accounts().unwrap().len(), 2);
+
+    // Keeping forgets the previews.
+    let again = request(vec![entry(Family::Evm, 0, None)], false, true);
+    assert!(rig.shell.add_accounts(again).is_err());
+}
+
+#[test]
+fn a_preview_keeps_nothing_and_entries_add_each_account_with_its_own_name() {
+    let mut rig = rig_with(Store::new());
+    let entry = |family, account, chain, label: Option<&str>| AddEntry {
+        family,
+        account,
+        chain,
+        label: label.map(Into::into),
+    };
+    let request = |preview| AddRequest {
+        families: Vec::new(),
+        chain: Chain::Main,
+        account: 0,
+        label: None,
+        entries: vec![
+            entry(Family::Evm, 0, None, None),
+            entry(Family::Evm, 3, None, Some("Savings")),
+            entry(Family::Bitcoin, 1, Some(Chain::Test), None),
+        ],
+        preview,
+        from_preview: false,
+        serial: None,
+        fingerprint: None,
+        master_key_id: None,
+        identify: false,
+        verify_only: false,
+    };
+    let shown = exported(&rig, request(true));
+    assert_eq!(shown.len(), 3);
+    assert_eq!(shown[1].path.as_deref(), Some("m/44'/60'/0'/0/3"));
+    assert_eq!(shown[2].path.as_deref(), Some("m/84'/1'/1'"));
+    assert!(
+        rig.shell.accounts().unwrap().is_empty(),
+        "a preview keeps nothing"
+    );
+
+    let added = exported(&rig, request(false));
+    assert_eq!(
+        added.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
+        shown.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
+        "the add keeps the accounts the preview showed"
+    );
+    assert_eq!(added[1].label.as_deref(), Some("Savings"));
+    assert_eq!(added[0].label, None);
+    assert_eq!(rig.shell.accounts().unwrap().len(), 3);
+
+    let mut both = request(false);
+    both.families = vec![Family::Evm];
+    assert!(
+        rig.shell.add_accounts(both).is_err(),
+        "families and entries both"
+    );
+    let mut many = request(false);
+    many.entries = (0..21).map(|i| entry(Family::Evm, i, None, None)).collect();
+    assert!(rig.shell.add_accounts(many).is_err(), "more than twenty");
+}
+
+#[test]
 fn an_unplugged_shell_keeps_its_accounts_listed_and_signs_nothing() {
     let mut rig = rig_with(Store::new());
     let evm = add(&rig, vec![Family::Evm], Chain::Test).remove(0);
@@ -520,6 +645,9 @@ fn additional_evm_accounts_keep_their_path_and_wallet_group() {
             master_key_id: None,
             identify: false,
             verify_only: false,
+            entries: Vec::new(),
+            preview: false,
+            from_preview: false,
         })
         .unwrap();
     answer_until(&rig.emu, true, || {
@@ -560,6 +688,9 @@ fn additional_evm_accounts_keep_their_path_and_wallet_group() {
             master_key_id: None,
             identify: false,
             verify_only: false,
+            entries: Vec::new(),
+            preview: false,
+            from_preview: false,
         })
         .unwrap();
     answer_until(&rig.emu, true, || {
@@ -679,6 +810,9 @@ fn legacy_wallet_migration_preserves_names_and_verifies_each_full_account_key() 
             master_key_id: None,
             identify: true,
             verify_only: false,
+            entries: Vec::new(),
+            preview: false,
+            from_preview: false,
         })
         .unwrap();
     answer_until(&migrated.emu, true, || {
@@ -746,6 +880,9 @@ fn one_seed_on_two_shells_is_one_wallet_and_signs_through_the_remaining_shell() 
                 master_key_id: None,
                 identify: false,
                 verify_only: false,
+                entries: Vec::new(),
+                preview: false,
+                from_preview: false,
             })
             .unwrap();
         answer_until(&emu, true, || {
@@ -770,6 +907,9 @@ fn one_seed_on_two_shells_is_one_wallet_and_signs_through_the_remaining_shell() 
             master_key_id: Some("different-root".into()),
             identify: false,
             verify_only: false,
+            entries: Vec::new(),
+            preview: false,
+            from_preview: false,
         })
         .unwrap();
     answer_until(&emu, true, || {
@@ -1144,6 +1284,9 @@ fn manual_verification_replaces_the_cache_without_changing_saved_wallets() {
                 master_key_id: Some(root.clone()),
                 identify: false,
                 verify_only: true,
+                entries: Vec::new(),
+                preview: false,
+                from_preview: false,
             })
             .unwrap();
         answer_until(&emu, true, || {

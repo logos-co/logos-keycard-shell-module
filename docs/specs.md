@@ -142,6 +142,11 @@ For the Shell's app:
 
 - `devices`: the Shells connected now, `{ ok, devices: [{ serial, firmware?, database?, busy }] }`.
 - `add_accounts`: takes `{ families, chain?, account?, label?, serial? }` and returns `{ ok, job }`. `chain` is `main` or `test`, the default `test`. `account` defaults to 0.
+  For several accounts at once, `entries: [{ family, account, chain?, label? }]` (up to 20) replaces
+  `families`, `account` and `label`. `preview: true` exports them to show and keeps none; the module
+  holds that export for 15 minutes, with the seed's unlock key when the wallet is new here.
+  `fromPreview: true` with `entries` keeps the picks from recent previews, each with its own name,
+  without asking the Shell again, and forgets the previews. Every pick must come from one wallet.
 - `add_status`: an export's progress, `{ ok, job, state, accounts?, error? }`. The state is `confirm_on_device`, `done` or `failed`.
 - `remove_account`: stop offering an account, `{ ok, removed }`.
 - `rename_account`: `(id, name)` → `{ ok }`, a local label; an empty name restores the default.

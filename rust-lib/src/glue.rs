@@ -37,7 +37,7 @@ pub trait KeycardShellModule: Send + Sync + 'static {
     fn rename_wallet(&self, id: String, name: String) -> String;
     fn forget_wallet(&self, id: String) -> String;
     /// Export accounts from a connected Shell, each confirmed on it:
-    /// `{ families, chain?, account?, label?, serial? }` → `{ ok, job }`.
+    /// `{ families | entries, chain?, account?, label?, serial?, preview?, fromPreview? }` → `{ ok, job }`.
     fn add_accounts(&self, params_json: String) -> String;
     /// An export's progress: `{ ok, job, state, accounts?, error? }`.
     fn add_status(&self, job: String) -> String;
