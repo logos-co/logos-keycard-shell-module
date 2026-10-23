@@ -12,6 +12,7 @@ use serde_json::json;
 use crate::link;
 use crate::signer::{AddRequest, Events, ShellSigner};
 use crate::store::Store;
+use logos_signer_interface::wallets::{read_data_key, DataKey, DataKeyRequest};
 
 pub trait KeycardShellModule: Send + Sync + 'static {
     // ── logos.signer/1 ──────────────────────────────────────────────────
@@ -21,6 +22,13 @@ pub trait KeycardShellModule: Send + Sync + 'static {
     fn sign_status(&self, job: String) -> String;
     fn sign_result(&self, job: String) -> String;
     fn cancel_sign(&self, job: String) -> String;
+    /// A seed's unlock key, for the signer manager alone: `{ seed, index }` → `{ ok, job }`; the
+    /// job waits in `confirm_on_device` until the person confirms on a Shell holding the seed.
+    fn unlock_key(&self, request_json: String) -> String;
+    fn unlock_key_status(&self, job: String) -> String;
+    /// `{ ok, job, key }`, once: the job forgets it.
+    fn unlock_key_result(&self, job: String) -> String;
+    fn cancel_unlock_key(&self, job: String) -> String;
 
     // ── the Shell's app ─────────────────────────────────────────────────
     /// The Shells connected now: `{ ok, devices: [{ serial, firmware?, database?, busy }] }`.
@@ -29,7 +37,7 @@ pub trait KeycardShellModule: Send + Sync + 'static {
     fn rename_wallet(&self, id: String, name: String) -> String;
     fn forget_wallet(&self, id: String) -> String;
     /// Export accounts from a connected Shell, each confirmed on it:
-    /// `{ families, chain?, account?, label?, serial? }` → `{ ok, job }`.
+    /// `{ families | entries, chain?, account?, label?, serial?, preview?, fromPreview? }` → `{ ok, job }`.
     fn add_accounts(&self, params_json: String) -> String;
     /// An export's progress: `{ ok, job, state, accounts?, error? }`.
     fn add_status(&self, job: String) -> String;
@@ -52,9 +60,24 @@ include!(concat!(
     "/generated/provider_gen.rs"
 ));
 
+/// The module behind `logos.wallets/1`: the signer manager, bound at runtime, since it depends on
+/// this module and this module can't depend on it.
+const WALLETS: &str = "signer_manager_module";
+
+fn from_manager() -> bool {
+    matches!(logos_rust_sdk::current_caller(), logos_rust_sdk::LogosCaller::Module { name, .. } if name == WALLETS)
+}
+
 struct Emit;
 
 impl Events for Emit {
+    /// The seed goes to the signer manager while its unlock key is at hand, so the person never
+    /// unlocks it a second time. Asked without waiting: without a manager the add stands.
+    fn seed_added(&self, seed: &str, unlock_key: Option<[u8; 33]>, name: &str) {
+        let body = json!({ "seed": seed, "kind": "keycard_shell", "unlockKey": unlock_key.map(hex::encode), "name": name })
+            .to_string();
+        wallets::WalletsClient::bind(WALLETS).enroll_seed_async(&body, |_| {});
+    }
     fn sign_progress(&self, job: &str, state: JobState) {
         emit_sign_progress(job, state.as_str());
     }
@@ -68,6 +91,71 @@ impl Events for Emit {
             "disconnected"
         });
     }
+}
+
+/// A seed's wallet opens with this module's key for it, which the signer manager gives once the
+/// person unlocks it in the Signer app, and closes when it locks. Asked from threads of their own,
+/// never while answering the manager, which would wait on itself.
+fn watch_wallets(shell: ShellSigner) {
+    let mut client = wallets::WalletsClient::bind(WALLETS);
+    let changed = client.on_wallets_changed();
+    let locked = client.on_wallets_locked();
+    let s = shell.clone();
+    std::thread::spawn(move || {
+        open_wallets(&s);
+        if let Ok(sub) = changed {
+            for _ in sub {
+                open_wallets(&s);
+            }
+        }
+    });
+    if let Ok(sub) = locked {
+        std::thread::spawn(move || {
+            for _ in sub {
+                shell.lock_seeds();
+                // Only some may have locked.
+                open_wallets(&shell);
+            }
+        });
+    }
+}
+
+/// Every closed seed's key; a locked one answers `locked` and stays closed.
+fn open_wallets(shell: &ShellSigner) {
+    for (seed, sealed_under) in shell.closed_seeds() {
+        let Some(current) = data_key(&seed, None) else {
+            continue;
+        };
+        let box_key = match sealed_under {
+            Some(g) if g != current.generation => match data_key(&seed, Some(g)) {
+                Some(k) => k,
+                None => continue,
+            },
+            _ => current.clone(),
+        };
+        if let Err(e) = shell.open_seed(&seed, &box_key, &current) {
+            eprintln!("keycard_shell_module: a wallet didn't open: {e}");
+        }
+    }
+}
+
+/// The key for a seed's document, named by its master key id, as the manager knows it.
+fn data_key(seed: &str, generation: Option<u32>) -> Option<DataKey> {
+    let body = serde_json::to_string(&DataKeyRequest {
+        seed: seed.to_string(),
+        scope: "accounts".into(),
+        generation,
+    })
+    .ok()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    wallets::WalletsClient::bind(WALLETS).data_key_async_with_timeout(
+        &body,
+        Duration::from_secs(10),
+        move |r| {
+            let _ = tx.send(r);
+        },
+    );
+    read_data_key(&rx.recv().ok()?.ok()?).ok()
 }
 
 struct KeycardShellModuleImpl {
@@ -127,6 +215,8 @@ impl KeycardShellModule for KeycardShellModuleImpl {
             #[serde(flatten)]
             payload: logos_signer_interface::Payload,
             secret: Option<logos_signer_interface::Secret>,
+            #[serde(default)]
+            xpub: Option<String>,
             keycard_account: Option<serde_json::Value>,
         }
         let request: Routed = match serde_json::from_str(&request_json) {
@@ -138,6 +228,7 @@ impl KeycardShellModule for KeycardShellModuleImpl {
             account: request.account,
             payload: request.payload,
             secret: request.secret,
+            xpub: request.xpub,
         };
         use logos_signer_interface::Signer;
         let result = if let Some(v) = request.keycard_account {
@@ -189,6 +280,34 @@ impl KeycardShellModule for KeycardShellModuleImpl {
 
     fn cancel_sign(&self, job: String) -> String {
         signer_json::cancel_sign(&mut self.shell.clone(), &job)
+    }
+
+    fn unlock_key(&self, request_json: String) -> String {
+        if !from_manager() {
+            return err("not authorized");
+        }
+        signer_json::unlock_key(&mut self.shell.clone(), &request_json)
+    }
+
+    fn unlock_key_status(&self, job: String) -> String {
+        if !from_manager() {
+            return err("not authorized");
+        }
+        signer_json::unlock_key_status(&mut self.shell.clone(), &job)
+    }
+
+    fn unlock_key_result(&self, job: String) -> String {
+        if !from_manager() {
+            return err("not authorized");
+        }
+        signer_json::unlock_key_result(&mut self.shell.clone(), &job)
+    }
+
+    fn cancel_unlock_key(&self, job: String) -> String {
+        if !from_manager() {
+            return err("not authorized");
+        }
+        signer_json::cancel_unlock_key(&mut self.shell.clone(), &job)
     }
 
     fn devices(&self) -> String {
@@ -254,7 +373,10 @@ impl KeycardShellModule for KeycardShellModuleImpl {
     fn on_context_ready(&self, ctx: &RustModuleContext) {
         // The accounts offered live in the module's own directory.
         match Store::open(&ctx.instance_persistence_path) {
-            Ok(store) => self.shell.set_store(store),
+            Ok(store) => {
+                self.shell.set_store(store);
+                watch_wallets(self.shell.clone());
+            }
             Err(e) => eprintln!(
                 "keycard_shell_module: {}: {e}",
                 ctx.instance_persistence_path

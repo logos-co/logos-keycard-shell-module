@@ -46,13 +46,40 @@ key on the Shell before it is exported:
   confirmations per Bitcoin account. The id is `shell-<fingerprint>-<purpose>-<coin>-<account>`,
   such as `shell-73c5da0a-84-1-0`.
 
-They are kept in `accounts.json` in the module's own directory. An account is `available` while the
-Shell it came from is connected. The module looks for Shells every second and a half, announces a
+They are kept in `accounts.sealed.json` in the module's own directory, one document per seed, named
+by its master key id: its accounts, its name and the Shells that hold it. Each is sealed under the
+module's key for that seed, `data_key({ seed: <master key id>, scope: "accounts" })` from the signer
+manager ([logos.wallets/1](https://github.com/logos-co/logos-signer-interface/blob/main/docs/wallets.md)),
+asked for when `wallets_changed` says a wallet unlocked, and written at 0600. While a seed is locked
+nothing of its wallet is shown or offered; an account added meanwhile waits in memory and joins it
+when it unlocks. `wallet_groups` lists such a wallet as `locked`, with no name and no accounts, so
+the app can say why. An account is `available` while a
+Shell that may hold its seed is connected: the Shell it came from, or one not yet verified, but not
+a Shell whose connection is verified to hold another seed. The module looks for Shells every second and a half, announces a
 change with `signer_changed` and `signer_accounts_changed`, and keeps every account listed either way.
 `remove_account` stops offering one. Nothing on the Shell changes, and it can be offered again.
 
 A Shell holds whatever card is inserted, so a different card behind the same serial signs with other
 keys. The manager then refuses its answer, because the signature doesn't recover to the account.
+
+## The seed's unlock key
+
+Every account names its `seed`: its wallet's master key id, the SHA-256 of the card's uncompressed
+master public key, as a Keycard's key UID. The signer manager unlocks that seed's data, in every
+app, with the public key at `m/1280263247'/n'`, which every holder of the seed gives.
+
+- **At add**, after the accounts, the Shell asks one more confirmation: the key at
+  `m/1280263247'/0'`. The module then registers the seed with the manager: `enroll_seed({ seed,
+  kind: "keycard_shell", unlockKey, name })` through `logos.wallets/1` (`wallets.lidl`), bound to
+  `signer_manager_module` at runtime and asked without waiting. A Shell that won't export it still
+  adds; its wallet then unlocks by a password.
+- **`unlock_key`** (`{ seed, index }`, the manager alone) returns a job in `confirm_on_device`.
+  - It runs on a connected Shell whose verified root is that seed, and exports the key at
+    `m/1280263247'/<index>'` once its person confirms.
+  - `unlock_key_result` gives the key once.
+  - Declined on the Shell, the job is `refused`.
+  - A seed no account comes from is `wrong_seed`; with no Shell connected, the call is
+    `unavailable`.
 
 ## Signing
 
@@ -75,6 +102,10 @@ keys. The manager then refuses its answer, because the signature doesn't recover
   internal key, which it tweaks by. The module names it where a wallet left it out: for this
   account's key-path spend, it is the key at the input's own path. An input that names another key,
   or a script tree, is refused as `invalid` before the Shell sees it.
+
+A Bitcoin request may bring the account's xpub, from the wallet that has it open; one that isn't
+the account's is refused. Nothing signs under the unlock keys' purpose, or at an EVM path outside
+`m/44'/60'`, whatever an edited store says.
 
 The answer is signatures only. The manager checks each one against the account over its own digest,
 and builds the signed transaction or PSBT itself.
@@ -100,8 +131,10 @@ Every reply is `{ "ok": true, … }` or `{ "ok": false, "error": …, "code"? }`
 
 The signer interface's methods, as `docs/interface.md` there specifies them:
 
-- `signer_info`: the interface, `keycard_shell`, the families and request kinds above, `showsRequest`, and `collects: nothing`.
-- `signer_accounts`: the offered accounts, each `available` while its Shell is connected.
+- `signer_info`: the interface, `keycard_shell`, the families and request kinds above, `showsRequest`, `collects: nothing` and `unlockKey: true`.
+- `signer_accounts`: the offered accounts, each naming its `seed`, and `available` while a Shell that may hold it is connected.
+- `unlock_key`, `unlock_key_status`, `unlock_key_result`, `cancel_unlock_key`: the signer manager
+  alone; see [The seed's unlock key](#the-seeds-unlock-key).
 - `sign`: a job, in `confirm_on_device` at once.
 - `sign_status`, `sign_result`, `cancel_sign`.
 
@@ -109,6 +142,11 @@ For the Shell's app:
 
 - `devices`: the Shells connected now, `{ ok, devices: [{ serial, firmware?, database?, busy }] }`.
 - `add_accounts`: takes `{ families, chain?, account?, label?, serial? }` and returns `{ ok, job }`. `chain` is `main` or `test`, the default `test`. `account` defaults to 0.
+  For several accounts at once, `entries: [{ family, account, chain?, label? }]` (up to 20) replaces
+  `families`, `account` and `label`. `preview: true` exports them to show and keeps none; the module
+  holds that export for 15 minutes, with the seed's unlock key when the wallet is new here.
+  `fromPreview: true` with `entries` keeps the picks from recent previews, each with its own name,
+  without asking the Shell again, and forgets the previews. Every pick must come from one wallet.
 - `add_status`: an export's progress, `{ ok, job, state, accounts?, error? }`. The state is `confirm_on_device`, `done` or `failed`.
 - `remove_account`: stop offering an account, `{ ok, removed }`.
 - `rename_account`: `(id, name)` → `{ ok }`, a local label; an empty name restores the default.

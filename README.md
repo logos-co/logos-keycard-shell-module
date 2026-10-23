@@ -39,7 +39,10 @@ Use `keycard_ui` for USB and reader wallets; the standalone Shell UI is supersed
 `wallet_groups`, `rename_wallet(id, name)` and `forget_wallet(id)` manage local USB wallets.
 The group key is `seed:<SHA256(SEC1-uncompressed-master-public-key)>`, matching the reader
 module's Keycard key UID. USB serials are connection metadata, independent of wallet identity.
-Existing `accounts.json` files remain readable. Legacy serial/fingerprint groups stay separate
+Each seed's wallet (its accounts, name, aliases and Shell serials) is kept in
+`accounts.sealed.json`, sealed under the module's key for that seed from the signer manager
+(`data_key({ seed: <master key id>, scope: "accounts" })`), and shown only while it is unlocked.
+Legacy serial/fingerprint groups, which name no seed, are kept in memory only and stay separate
 until `add_accounts` with `identify: true` exports the master public key and verifies each
 saved account key. This migration keeps account IDs/labels and wallet names; merged names
 are retained in `aliases`. The metadata is committed atomically after all confirmations.
