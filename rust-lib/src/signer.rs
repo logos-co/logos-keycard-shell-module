@@ -431,7 +431,7 @@ impl Shared {
         // The wallet's own name, never an account's.
         let name = Some(lock(&self.store).wallet_name(&format!("seed:{root}")))
             .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| "Keycard Shell".into());
+            .unwrap_or_else(|| format!("Keycard Shell {}", root.get(..8).unwrap_or(root)));
         self.events.seed_added(root, unlock_key, &name);
         self.events.accounts_changed(lock(&self.store).list().len());
         Ok(accounts)
