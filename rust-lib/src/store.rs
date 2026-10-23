@@ -110,6 +110,13 @@ impl Store {
         self.connections = s.connections;
     }
 
+    /// A seed this store keeps a wallet of, locked or not.
+    pub fn knows(&self, seed: &str) -> bool {
+        self.docs.seeds().iter().any(|s| s == seed)
+            || self.waiting.contains_key(seed)
+            || self.offered.iter().any(|o| o.master_key_id == seed)
+    }
+
     /// Sealed, and its key not given yet.
     fn is_locked(&self, seed: &str) -> bool {
         self.docs.wanted(seed).is_some()

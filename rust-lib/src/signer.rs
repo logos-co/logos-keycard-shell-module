@@ -1168,11 +1168,8 @@ impl Signer for ShellSigner {
     fn unlock_key(&mut self, request: UnlockKeyRequest) -> logos_signer_interface::Result<String> {
         logos_signer_interface::unlock::unlock_key_path(request.index)?;
         let seed = request.seed.trim().to_string();
-        if !lock(&self.s.store)
-            .list()
-            .iter()
-            .any(|o| o.master_key_id == seed)
-        {
+        // A locked wallet lists no account, and this is how it unlocks: its seed is known all the same.
+        if !lock(&self.s.store).knows(&seed) {
             return Err(err(
                 ErrorCode::WrongSeed,
                 "no Shell account comes from this seed",

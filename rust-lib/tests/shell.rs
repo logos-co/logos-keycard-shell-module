@@ -1271,6 +1271,42 @@ fn the_shell_gives_its_phrases_unlock_key_once_its_person_confirms() {
 }
 
 #[test]
+fn a_locked_wallet_still_gives_its_unlock_key() {
+    let dir = std::env::temp_dir().join(format!(
+        "shell-locked-key-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let rig = rig_with(Store::open(&dir).unwrap());
+    let seed = add(&rig, vec![Family::Evm], Chain::Test)[0]
+        .seed
+        .clone()
+        .expect("an added account names its seed");
+    unlock_all(&rig);
+    drop(rig);
+    // After a restart the wallet is locked: no account listed, its seed known.
+    let mut rig = rig_with(Store::open(&dir).unwrap());
+    assert!(rig.shell.accounts().unwrap().is_empty());
+    let job = rig
+        .shell
+        .unlock_key(UnlockKeyRequest {
+            seed,
+            index: 0,
+            secret: None,
+        })
+        .expect("a locked wallet's seed is known");
+    answer_until(&rig.emu, true, || {
+        rig.shell.unlock_key_status(&job).unwrap().state.is_final()
+    });
+    assert_eq!(
+        rig.shell.unlock_key_result(&job).unwrap().key.expose(),
+        phrase_unlock_key(PHRASE, 0)
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn a_shell_verified_to_hold_another_seed_leaves_this_ones_accounts_unavailable() {
     let rig = rig_with(Store::new());
     let added = add(&rig, vec![Family::Evm], Chain::Test);
