@@ -8,11 +8,11 @@ intro: |
   confirmed on the Shell's own screen. The module holds no secret: the keys stay on the card inside
   the Shell.
 
-  This doc-test runs headless through `logoscore`, against `keycard-shell-emulator`: a Shell in
+  This doc-test runs headless through `logosctl`, against `keycard-shell-emulator`: a Shell in
   software that answers the firmware's USB commands over the same frames, from the
   "abandon … about" test phrase, and confirms every request at once. A real Shell asks its person.
 
-what_you_build: "The Keycard Shell module, the signer manager and an emulated Shell, driven through a `logoscore` daemon."
+what_you_build: "The Keycard Shell module, the signer manager and an emulated Shell, driven through a `logosctl` daemon."
 
 what_you_learn:
   - How accounts are offered from a Shell, each key confirmed on it
@@ -24,17 +24,14 @@ prerequisites:
   - "**A Linux or macOS machine.** Everything here is offline, and no Shell is needed."
 
 sections:
-  - title: "Build logoscore and lgpm"
+  - title: "Build logosctl"
     step: true
     steps:
-      - title: "Build logoscore"
-        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos"
-        check_file: "logos/bin/logoscore"
-      - title: "Build lgpm"
-        run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
-        check_file: "lgpm/bin/lgpm"
+      - title: "Build logosctl"
+        run: "nix build 'github:logos-co/logos-logoscore-cli#ctl' --out-link ./logos"
+        check_file: "logos/bin/logosctl"
 
-  - title: "Build and install the modules"
+  - title: "Build the modules"
     step: true
     text: |
       The manager is pinned to the commit that hands a device with a screen the whole request. Its
@@ -53,18 +50,6 @@ sections:
           nix build '.#emulator' -o emulator      # a Shell in software, for tests
         expect_contains:
           - "keycard-shell-emulator"
-      - title: "Install them"
-        run: |
-          mkdir -p modules
-          cp -RL ./logos/modules/. ./modules/
-          chmod -R u+w modules
-          for p in shell keystore manager probe; do ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file $p-lgx/*.lgx; done
-          ./lgpm/bin/lgpm --modules-dir ./modules list
-        code_block: "lgpm --modules-dir ./modules --allow-unsigned install --file shell-lgx/*.lgx"
-        expect_contains:
-          - "keycard_shell_module"
-          - "signer_manager_module"
-          - "manager_probe"
 
   - title: "An emulated Shell, and the daemon"
     step: true
@@ -76,22 +61,37 @@ sections:
           - "127.0.0.1:"
       - title: "Start the daemon, pointed at it"
         text: "Without `KEYCARD_SHELL_EMULATOR`, the module looks for a Shell on USB."
-        run: "sh -c 'KEYCARD_SHELL_EMULATOR=$(cat shell.addr) ./logos/bin/logoscore -D -m ./modules > logs.txt 2>&1 &'"
-        code_block: "KEYCARD_SHELL_EMULATOR=127.0.0.1:<port> logoscore -D -m ./modules > logs.txt &"
-      - run: "sleep 3"
+        # The bundled package downloader starts a storage node in $HOME; keep it out of the real one.
+        run: "mkdir -p home && KEYCARD_SHELL_EMULATOR=$(cat shell.addr) HOME=\"$PWD/home\" ./logos/bin/logosctl --config-dir ./session daemon start --detach"
+        code_block: "KEYCARD_SHELL_EMULATOR=127.0.0.1:<port> logosctl daemon start --detach"
+        expect_contains:
+          - "Daemon started"
+      - title: "Install them"
+        text: |
+          Copy the packages into `./packages` and install them all into the daemon's session. They are
+          unsigned local builds, which the default signature policy accepts with a warning.
+        run: |
+          mkdir -p packages && cp -f *-lgx/*.lgx packages/
+          ./logos/bin/logosctl --config-dir ./session install --dir packages -y
+          ./logos/bin/logosctl --config-dir ./session package ls
+        code_block: "logosctl install --dir packages -y"
+        expect_contains:
+          - "keycard_shell_module"
+          - "signer_manager_module"
+          - "manager_probe"
       - title: "Load the Shell module, and the probe with the manager"
         run: |
-          ./logos/bin/logoscore load-module keycard_shell_module
-          ./logos/bin/logoscore load-module manager_probe
+          ./logos/bin/logosctl --config-dir ./session module load keycard_shell_module
+          ./logos/bin/logosctl --config-dir ./session module load manager_probe
         code_block: |
-          logoscore load-module keycard_shell_module
-          logoscore load-module manager_probe
+          logosctl module load keycard_shell_module
+          logosctl module load manager_probe
         expect_contains:
           - "keycard_shell_module"
           - "signer_manager_module"
       - title: "It signs whole requests, on its own screen"
-        run: "./logos/bin/logoscore call keycard_shell_module signer_info"
-        code_block: "logoscore call keycard_shell_module signer_info"
+        run: "./logos/bin/logosctl --config-dir ./session call keycard_shell_module signer_info"
+        code_block: "logosctl call keycard_shell_module signer_info"
         expect_contains:
           - '\"kind\":\"keycard_shell\"'
           - '\"showsRequest\":true'
@@ -99,8 +99,8 @@ sections:
           - "evm_transaction"
           - "btc_psbt"
       - title: "The Shell is connected"
-        run: "./logos/bin/logoscore call keycard_shell_module devices"
-        code_block: "logoscore call keycard_shell_module devices"
+        run: "./logos/bin/logosctl --config-dir ./session call keycard_shell_module devices"
+        code_block: "logosctl call keycard_shell_module devices"
         expect_contains:
           - '\"firmware\":\"1.4.0\"'
 
@@ -113,13 +113,13 @@ sections:
     steps:
       - title: "An EVM, a native segwit and a taproot account"
         run: |
-          ./logos/bin/logoscore call keycard_shell_module add_accounts '{"families":["evm","bitcoin","bitcoin_taproot"],"chain":"test"}' > add.json
+          ./logos/bin/logosctl --config-dir ./session call keycard_shell_module add_accounts '{"families":["evm","bitcoin","bitcoin_taproot"],"chain":"test"}' > add.json
           job=$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' add.json job)
-          for i in $(seq 1 40); do ./logos/bin/logoscore call keycard_shell_module add_status "$job" > added.json; grep -Eq 'state.....(done|failed)' added.json && break; sleep 0.5; done
+          for i in $(seq 1 40); do ./logos/bin/logosctl --config-dir ./session call keycard_shell_module add_status "$job" > added.json; grep -Eq 'state.....(done|failed)' added.json && break; sleep 0.5; done
           cat added.json
         code_block: |
-          logoscore call keycard_shell_module add_accounts '{"families":["evm","bitcoin","bitcoin_taproot"],"chain":"test"}'
-          logoscore call keycard_shell_module add_status <job>     # done, once confirmed on the Shell
+          logosctl call keycard_shell_module add_accounts '{"families":["evm","bitcoin","bitcoin_taproot"],"chain":"test"}'
+          logosctl call keycard_shell_module add_status <job>     # done, once confirmed on the Shell
         expect_contains:
           - '\"state\":\"done\"'
           - "0x9858effd232b4033e47d90003d41ec34ecaeda94"
@@ -127,11 +127,11 @@ sections:
           - "shell-73c5da0a-86-1-0"
       - title: "The manager lists them under the Shell"
         run: |
-          ./logos/bin/logoscore call signer_manager_module configure '{"approvers":"manager_probe","custodians":"manager_probe","signers":["keycard_shell_module"]}'
-          ./logos/bin/logoscore call signer_manager_module accounts
+          ./logos/bin/logosctl --config-dir ./session call signer_manager_module configure '{"approvers":"manager_probe","custodians":"manager_probe","signers":["keycard_shell_module"]}'
+          ./logos/bin/logosctl --config-dir ./session call signer_manager_module accounts
         code_block: |
-          logoscore call signer_manager_module configure '{…, "signers":["keycard_shell_module"]}'
-          logoscore call signer_manager_module accounts
+          logosctl call signer_manager_module configure '{…, "signers":["keycard_shell_module"]}'
+          logosctl call signer_manager_module accounts
         expect_contains:
           - '\"signer\":\"keycard_shell_module\"'
           - "0x9858effd232b4033e47d90003d41ec34ecaeda94"
@@ -145,18 +145,18 @@ sections:
     steps:
       - title: "A message"
         run: |
-          ./logos/bin/logoscore call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a Shell","legs":[{"kind":"message","text":"signed on the Shell"}]}' > mreq.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a Shell","legs":[{"kind":"message","text":"signed on the Shell"}]}' > mreq.json
           python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' mreq.json handle > mhandle; python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' mreq.json receipt > mreceipt
-          ./logos/bin/logoscore call manager_probe acknowledge "$(cat mhandle)" > mshown.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe acknowledge "$(cat mhandle)" > mshown.json
           cat mshown.json
-          ./logos/bin/logoscore call manager_probe approve "$(cat mhandle)" "$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' mshown.json bundle_id)" ""
-          for i in $(seq 1 40); do ./logos/bin/logoscore call manager_probe status "$(cat mhandle)" "$(cat mreceipt)" > mstatus.json; grep -q 'settled' mstatus.json && break; sleep 0.5; done
+          ./logos/bin/logosctl --config-dir ./session call manager_probe approve "$(cat mhandle)" "$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' mshown.json bundle_id)" ""
+          for i in $(seq 1 40); do ./logos/bin/logosctl --config-dir ./session call manager_probe status "$(cat mhandle)" "$(cat mreceipt)" > mstatus.json; grep -q 'settled' mstatus.json && break; sleep 0.5; done
           cat mstatus.json
-          ./logos/bin/logoscore call manager_probe fetch "$(cat mhandle)" "$(cat mreceipt)"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe fetch "$(cat mhandle)" "$(cat mreceipt)"
         code_block: |
-          logoscore call manager_probe request '{"address":"0x9858…aEda94","legs":[{"kind":"message","text":"signed on the Shell"}]}'
-          logoscore call manager_probe approve <handle> <bundle_id> ""   # signing: the Shell shows it
-          logoscore call manager_probe fetch <handle> <receipt>
+          logosctl call manager_probe request '{"address":"0x9858…aEda94","legs":[{"kind":"message","text":"signed on the Shell"}]}'
+          logosctl call manager_probe approve <handle> <bundle_id> ""   # signing: the Shell shows it
+          logosctl call manager_probe fetch <handle> <receipt>
         expect_contains:
           - '\"collects\":\"nothing\"'
           - '\"signer\":\"keycard_shell_module\"'
@@ -164,14 +164,14 @@ sections:
           - '\"signed\":[\"0x'
       - title: "A Sepolia transaction"
         run: |
-          ./logos/bin/logoscore call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a Shell","legs":[{"kind":"tx","chain_id":11155111,"tx":{"to":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","value":"0x1","nonce":"0x0","gas_limit":"0x5208","fee_mode":"eip1559","max_fee_per_gas":"0x3b9aca00","max_priority_fee_per_gas":"0x1"}}]}' > treq.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test on a Shell","legs":[{"kind":"tx","chain_id":11155111,"tx":{"to":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","value":"0x1","nonce":"0x0","gas_limit":"0x5208","fee_mode":"eip1559","max_fee_per_gas":"0x3b9aca00","max_priority_fee_per_gas":"0x1"}}]}' > treq.json
           python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' treq.json handle > thandle; python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' treq.json receipt > treceipt
-          ./logos/bin/logoscore call manager_probe acknowledge "$(cat thandle)" > tshown.json
-          ./logos/bin/logoscore call manager_probe approve "$(cat thandle)" "$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' tshown.json bundle_id)" ""
-          for i in $(seq 1 40); do ./logos/bin/logoscore call manager_probe status "$(cat thandle)" "$(cat treceipt)" > tstatus.json; grep -q 'settled' tstatus.json && break; sleep 0.5; done
+          ./logos/bin/logosctl --config-dir ./session call manager_probe acknowledge "$(cat thandle)" > tshown.json
+          ./logos/bin/logosctl --config-dir ./session call manager_probe approve "$(cat thandle)" "$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' tshown.json bundle_id)" ""
+          for i in $(seq 1 40); do ./logos/bin/logosctl --config-dir ./session call manager_probe status "$(cat thandle)" "$(cat treceipt)" > tstatus.json; grep -q 'settled' tstatus.json && break; sleep 0.5; done
           cat tstatus.json
-          ./logos/bin/logoscore call manager_probe fetch "$(cat thandle)" "$(cat treceipt)"
-        code_block: "logoscore call manager_probe request '{…, \"legs\":[{\"kind\":\"tx\",\"chain_id\":11155111, …}]}'"
+          ./logos/bin/logosctl --config-dir ./session call manager_probe fetch "$(cat thandle)" "$(cat treceipt)"
+        code_block: "logosctl call manager_probe request '{…, \"legs\":[{\"kind\":\"tx\",\"chain_id\":11155111, …}]}'"
         expect_contains:
           - '\"reason\":\"approved\"'
           - '\"signed\":[\"0x02'
@@ -182,9 +182,9 @@ sections:
       - title: "The taproot account is no longer offered"
         text: "Nothing on the Shell changes; it can be offered again."
         run: |
-          ./logos/bin/logoscore call keycard_shell_module remove_account shell-73c5da0a-86-1-0
-          ./logos/bin/logoscore call keycard_shell_module signer_accounts
-        code_block: "logoscore call keycard_shell_module remove_account shell-73c5da0a-86-1-0"
+          ./logos/bin/logosctl --config-dir ./session call keycard_shell_module remove_account shell-73c5da0a-86-1-0
+          ./logos/bin/logosctl --config-dir ./session call keycard_shell_module signer_accounts
+        code_block: "logosctl call keycard_shell_module remove_account shell-73c5da0a-86-1-0"
         expect_contains:
           - '\"removed\":true'
           - "shell-73c5da0a-84-1-0"
@@ -193,13 +193,13 @@ sections:
     step: true
     steps:
       - title: "Stop the daemon"
-        run: "./logos/bin/logoscore stop"
-        code_block: "logoscore stop"
+        run: "./logos/bin/logosctl --config-dir ./session daemon stop"
+        code_block: "logosctl daemon stop"
       - title: "Stop the emulated Shell"
         run: "kill $(cat shell.pid)"
       - run: "sleep 2"
       - title: "Confirm the daemon has stopped"
-        run: "./logos/bin/logoscore status || true"
-        code_block: "logoscore status"
+        run: "./logos/bin/logosctl --config-dir ./session daemon status || true"
+        code_block: "logosctl daemon status"
         expect_contains:
           - '"status":"not_running"'
