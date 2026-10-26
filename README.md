@@ -13,7 +13,7 @@ module holds no secret.
 
 See [`docs/specs.md`](docs/specs.md) for the reference, and
 [`doctests/keycard-shell-runtime.test.yaml`](doctests/keycard-shell-runtime.test.yaml) for the
-round trip through `logoscore` and the signer manager.
+round trip through `logosctl` and the signer manager.
 
 ```sh
 cd rust-lib && cargo test --no-default-features --features emulator
