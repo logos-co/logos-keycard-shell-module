@@ -11,7 +11,7 @@ use keycard_shell_module::apdu::{self, ShellError, Transport};
 use keycard_shell_module::commands;
 use keycard_shell_module::emulator::{Confirm, Emulator, PHRASE};
 use keycard_shell_module::link::{Devices, Emulated};
-use keycard_shell_module::signer::{AddRequest, Quiet, ShellSigner};
+use keycard_shell_module::signer::{AddEntry, AddRequest, Quiet, ShellSigner};
 use keycard_shell_module::store::Store;
 use logos_signer_interface::conformance::{self, Fixture};
 use logos_signer_interface::verify::check;
@@ -64,6 +64,29 @@ struct Rig {
     forbid_public: Arc<AtomicBool>,
 }
 
+fn key(byte: u8) -> logos_signer_interface::wallets::DataKey {
+    logos_signer_interface::wallets::DataKey {
+        key: Secret::new(hex::encode([byte; 32])),
+        generation: 0,
+    }
+}
+
+/// The store kept in `dir`, every seed in it unlocked.
+fn unlocked(dir: &std::path::Path) -> Store {
+    let mut store = Store::open(dir).unwrap();
+    for (seed, _) in store.closed() {
+        store.unlock(&seed, &key(1), &key(1)).unwrap();
+    }
+    store
+}
+
+/// `rig`'s seeds unlocked, as the signer manager's key would.
+fn unlock_all(rig: &Rig) {
+    for (seed, _) in rig.shell.closed_seeds() {
+        rig.shell.open_seed(&seed, &key(1), &key(1)).unwrap();
+    }
+}
+
 fn rig_with(store: Store) -> Rig {
     let emu = Emulator::new(PHRASE, Confirm::Manual);
     let addr = emu.listen().unwrap();
@@ -100,20 +123,31 @@ fn answer_until(emu: &Emulator, yes: bool, mut done: impl FnMut() -> bool) {
 }
 
 fn add(rig: &Rig, families: Vec<Family>, chain: Chain) -> Vec<Account> {
-    let job = rig
-        .shell
-        .add_accounts(AddRequest {
+    let got = exported(
+        rig,
+        AddRequest {
             families,
             chain,
             account: 0,
             label: None,
+            entries: Vec::new(),
+            preview: false,
+            from_preview: false,
             serial: None,
             fingerprint: None,
             master_key_id: None,
             identify: false,
             verify_only: false,
-        })
-        .unwrap();
+        },
+    );
+    // Unnamed, an account keeps no name: apps show its kind and address.
+    assert!(got.iter().all(|a| a.label.is_none()), "{got:?}");
+    got
+}
+
+/// An export's accounts once it ends, every question answered yes.
+fn exported(rig: &Rig, req: AddRequest) -> Vec<Account> {
+    let job = rig.shell.add_accounts(req).unwrap();
     let mut out = None;
     answer_until(&rig.emu, true, || match rig.shell.add_status(&job) {
         Some(a) if a.state == "done" => {
@@ -144,6 +178,7 @@ fn sign(rig: &mut Rig, account: &Account, payload: Payload) -> Result<Vec<Signat
         account: account.id.clone(),
         payload,
         secret: None,
+        xpub: None,
     })?;
     settle(rig, &job, true);
     rig.shell.result(&job)
@@ -197,12 +232,20 @@ fn it_passes_the_conformance_suite() {
             wrong_secret: None,
         },
         &mut |s, job| {
-            answer_until(&emu, true, || {
-                emu.asking().is_some() || s.status(job).unwrap().state.is_final()
-            });
+            answer_until(&emu, true, || emu.asking().is_some() || ended(s, job));
             emu.press(true);
         },
     );
+}
+
+/// A signing job or an unlock-key job has settled, whichever `job` is.
+fn ended(s: &mut ShellSigner, job: &str) -> bool {
+    match s.status(job) {
+        Ok(st) => st.state.is_final(),
+        Err(_) => s
+            .unlock_key_status(job)
+            .map_or(true, |st| st.state.is_final()),
+    }
 }
 
 #[test]
@@ -262,6 +305,7 @@ fn a_refusal_on_the_shell_is_a_refused_job() {
                 message: hex::encode("no thanks"),
             },
             secret: None,
+            xpub: None,
         })
         .unwrap();
     let st = settle(&mut rig, &job, false);
@@ -280,6 +324,7 @@ fn a_refusal_on_the_shell_is_a_refused_job() {
                 psbt,
             },
             secret: None,
+            xpub: None,
         })
         .unwrap();
     let st = settle(&mut rig, &job, false);
@@ -300,6 +345,7 @@ fn one_request_at_a_time_and_a_cancelled_one_signs_nothing() {
             message: hex::encode(text),
         },
         secret: None,
+        xpub: None,
     };
     let first = rig.shell.sign(ask("first")).unwrap();
     assert_eq!(
@@ -324,6 +370,123 @@ fn one_request_at_a_time_and_a_cancelled_one_signs_nothing() {
 }
 
 #[test]
+fn accounts_a_preview_showed_are_kept_from_it_without_the_shell() {
+    let mut rig = rig_with(Store::new());
+    let request = |entries: Vec<AddEntry>, preview, from_preview| AddRequest {
+        families: Vec::new(),
+        chain: Chain::Main,
+        account: 0,
+        label: None,
+        entries,
+        preview,
+        from_preview,
+        serial: None,
+        fingerprint: None,
+        master_key_id: None,
+        identify: false,
+        verify_only: false,
+    };
+    let entry = |family, account, label: Option<&str>| AddEntry {
+        family,
+        account,
+        chain: None,
+        label: label.map(Into::into),
+    };
+    let page = exported(
+        &rig,
+        request(
+            (0..5).map(|i| entry(Family::Evm, i, None)).collect(),
+            true,
+            false,
+        ),
+    );
+    let btc = exported(
+        &rig,
+        request(vec![entry(Family::Bitcoin, 2, None)], true, false),
+    );
+
+    // Unplugged: keeping asks nothing of the Shell.
+    rig.on.store(false, Ordering::SeqCst);
+    rig.shell.refresh();
+    let keep = request(
+        vec![
+            entry(Family::Evm, 4, Some("Rent")),
+            entry(Family::Bitcoin, 2, None),
+        ],
+        false,
+        true,
+    );
+    let job = rig.shell.add_accounts(keep).unwrap();
+    let kept = rig.shell.add_status(&job).unwrap();
+    assert_eq!(kept.state, "done");
+    assert_eq!(kept.accounts[0].id, page[4].id);
+    assert_eq!(kept.accounts[0].label.as_deref(), Some("Rent"));
+    assert_eq!(kept.accounts[1].id, btc[0].id);
+    assert_eq!(rig.shell.accounts().unwrap().len(), 2);
+
+    // Keeping forgets the previews.
+    let again = request(vec![entry(Family::Evm, 0, None)], false, true);
+    assert!(rig.shell.add_accounts(again).is_err());
+}
+
+#[test]
+fn a_preview_keeps_nothing_and_entries_add_each_account_with_its_own_name() {
+    let mut rig = rig_with(Store::new());
+    let entry = |family, account, chain, label: Option<&str>| AddEntry {
+        family,
+        account,
+        chain,
+        label: label.map(Into::into),
+    };
+    let request = |preview| AddRequest {
+        families: Vec::new(),
+        chain: Chain::Main,
+        account: 0,
+        label: None,
+        entries: vec![
+            entry(Family::Evm, 0, None, None),
+            entry(Family::Evm, 3, None, Some("Savings")),
+            entry(Family::Bitcoin, 1, Some(Chain::Test), None),
+        ],
+        preview,
+        from_preview: false,
+        serial: None,
+        fingerprint: None,
+        master_key_id: None,
+        identify: false,
+        verify_only: false,
+    };
+    let shown = exported(&rig, request(true));
+    assert_eq!(shown.len(), 3);
+    assert_eq!(shown[1].path.as_deref(), Some("m/44'/60'/0'/0/3"));
+    assert_eq!(shown[2].path.as_deref(), Some("m/84'/1'/1'"));
+    assert!(
+        rig.shell.accounts().unwrap().is_empty(),
+        "a preview keeps nothing"
+    );
+
+    let added = exported(&rig, request(false));
+    assert_eq!(
+        added.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
+        shown.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
+        "the add keeps the accounts the preview showed"
+    );
+    assert_eq!(added[1].label.as_deref(), Some("Savings"));
+    assert_eq!(added[0].label, None);
+    assert_eq!(rig.shell.accounts().unwrap().len(), 3);
+
+    let mut both = request(false);
+    both.families = vec![Family::Evm];
+    assert!(
+        rig.shell.add_accounts(both).is_err(),
+        "families and entries both"
+    );
+    let mut many = request(false);
+    many.entries = (0..21).map(|i| entry(Family::Evm, i, None, None)).collect();
+    assert!(rig.shell.add_accounts(many).is_err(), "more than twenty");
+}
+
+#[test]
 fn an_unplugged_shell_keeps_its_accounts_listed_and_signs_nothing() {
     let mut rig = rig_with(Store::new());
     let evm = add(&rig, vec![Family::Evm], Chain::Test).remove(0);
@@ -340,6 +503,7 @@ fn an_unplugged_shell_keeps_its_accounts_listed_and_signs_nothing() {
                 message: "00".into(),
             },
             secret: None,
+            xpub: None,
         })
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::Unavailable);
@@ -351,8 +515,29 @@ fn its_accounts_are_kept_and_can_be_removed() {
     let _ = std::fs::remove_dir_all(&dir);
     let rig = rig_with(Store::open(&dir).unwrap());
     let added = add(&rig, vec![Family::Evm, Family::BitcoinTaproot], Chain::Test);
+    unlock_all(&rig);
     drop(rig);
-    let mut again = rig_with(Store::open(&dir).unwrap());
+    let mut locked = rig_with(Store::open(&dir).unwrap());
+    let groups = locked.shell.wallet_groups();
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    assert_eq!(
+        (groups[0]["locked"].clone(), groups[0]["name"].clone()),
+        (serde_json::json!(true), serde_json::json!(""))
+    );
+    assert!(
+        locked.shell.accounts().unwrap().is_empty(),
+        "none offered while locked"
+    );
+    let more = add(&locked, vec![Family::Bitcoin], Chain::Test);
+    assert!(
+        locked.shell.accounts().unwrap().is_empty(),
+        "one added while locked waits for the key"
+    );
+    unlock_all(&locked);
+    assert_eq!(locked.shell.accounts().unwrap().len(), 3);
+    assert!(locked.shell.remove_account(&more[0].id).unwrap());
+    drop(locked);
+    let mut again = rig_with(unlocked(&dir));
     let listed = again.shell.accounts().unwrap();
     assert_eq!(
         listed.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
@@ -360,10 +545,13 @@ fn its_accounts_are_kept_and_can_be_removed() {
     );
     assert!(again.shell.remove_account(&added[1].id).unwrap());
     assert_eq!(again.shell.accounts().unwrap().len(), 1);
-    let kept = std::fs::read_to_string(dir.join("accounts.json")).unwrap();
+    let kept = std::fs::read_to_string(dir.join("accounts.sealed.json")).unwrap();
+    for public in [&added[0].id, &added[1].id] {
+        assert!(!kept.contains(public.as_str()), "{kept}");
+    }
     assert!(
-        !kept.contains("xprv") && !kept.contains("tprv"),
-        "public material only"
+        !kept.contains("pub") && !kept.contains("prv") && !kept.contains(&again.emu.serial()),
+        "{kept}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -422,6 +610,7 @@ fn a_taproot_psbt_naming_another_internal_key_is_refused_before_the_shell() {
                 psbt,
             },
             secret: None,
+            xpub: None,
         })
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid, "{}", e.message);
@@ -456,6 +645,9 @@ fn additional_evm_accounts_keep_their_path_and_wallet_group() {
             master_key_id: None,
             identify: false,
             verify_only: false,
+            entries: Vec::new(),
+            preview: false,
+            from_preview: false,
         })
         .unwrap();
     answer_until(&rig.emu, true, || {
@@ -496,6 +688,9 @@ fn additional_evm_accounts_keep_their_path_and_wallet_group() {
             master_key_id: None,
             identify: false,
             verify_only: false,
+            entries: Vec::new(),
+            preview: false,
+            from_preview: false,
         })
         .unwrap();
     answer_until(&rig.emu, true, || {
@@ -531,13 +726,14 @@ fn wallet_names_and_empty_wallets_survive_reload() {
         .to_owned();
     rig.shell.rename_wallet(&id, "Travel").unwrap();
     rig.shell.remove_account(&account.id).unwrap();
-    let restored = rig_with(Store::open(&dir).unwrap());
+    unlock_all(&rig);
+    let restored = rig_with(unlocked(&dir));
     let groups = restored.shell.wallet_groups();
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0]["name"], "Travel");
     assert!(groups[0]["accounts"].as_array().unwrap().is_empty());
     restored.shell.forget_wallet(&id).unwrap();
-    assert!(Store::open(&dir).unwrap().wallet_names().is_empty());
+    assert!(Store::open(&dir).unwrap().closed().is_empty());
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -546,20 +742,14 @@ fn account_renaming_persists_without_changing_keys_and_rolls_back_on_write_failu
     let dir = std::env::temp_dir().join(format!("shell-account-name-{}", std::process::id()));
     let rig = rig_with(Store::open(&dir).unwrap());
     let account = add(&rig, vec![Family::Evm], Chain::Main).remove(0);
-    let original = Store::open(&dir)
-        .unwrap()
-        .find(&account.id)
-        .unwrap()
-        .clone();
+    unlock_all(&rig);
+    let original = unlocked(&dir).find(&account.id).unwrap().clone();
     rig.shell
         .rename_account(&account.id.to_uppercase(), "  Travel ETH  ")
         .unwrap();
     let mut expected = original.clone();
     expected.account.label = Some("Travel ETH".into());
-    assert_eq!(
-        Store::open(&dir).unwrap().find(&account.id),
-        Some(&expected)
-    );
+    assert_eq!(unlocked(&dir).find(&account.id), Some(&expected));
     assert_eq!(
         rig.shell.wallet_groups()[0]["accounts"][0]["label"],
         "Travel ETH"
@@ -572,10 +762,7 @@ fn account_renaming_persists_without_changing_keys_and_rolls_back_on_write_failu
     assert!(rig.shell.rename_account(&account.id, "bad\nname").is_err());
     rig.shell.rename_account(&account.id, " ").unwrap();
     expected.account.label = None;
-    assert_eq!(
-        Store::open(&dir).unwrap().find(&account.id),
-        Some(&expected)
-    );
+    assert_eq!(unlocked(&dir).find(&account.id), Some(&expected));
     std::fs::remove_dir_all(&dir).unwrap();
     std::fs::write(&dir, "not a directory").unwrap();
     assert!(rig.shell.rename_account(&account.id, "Unsaved").is_err());
@@ -588,13 +775,10 @@ fn legacy_wallet_migration_preserves_names_and_verifies_each_full_account_key() 
     let dir = std::env::temp_dir().join(format!("shell-seed-migrate-{}", std::process::id()));
     let rig = rig_with(Store::open(&dir).unwrap());
     let account = add(&rig, vec![Family::Evm], Chain::Main).remove(0);
-    let mut old = Store::open(&dir)
-        .unwrap()
-        .find(&account.id)
-        .unwrap()
-        .clone();
+    unlock_all(&rig);
+    let mut old = unlocked(&dir).find(&account.id).unwrap().clone();
     let root = old.master_key_id.clone();
-    let mut guarded = Store::open(&dir).unwrap();
+    let mut guarded = unlocked(&dir);
     let original = old.clone();
     let mut wrong_key = old.clone();
     wrong_key.key = "other full public key".into();
@@ -626,6 +810,9 @@ fn legacy_wallet_migration_preserves_names_and_verifies_each_full_account_key() 
             master_key_id: None,
             identify: true,
             verify_only: false,
+            entries: Vec::new(),
+            preview: false,
+            from_preview: false,
         })
         .unwrap();
     answer_until(&migrated.emu, true, || {
@@ -693,6 +880,9 @@ fn one_seed_on_two_shells_is_one_wallet_and_signs_through_the_remaining_shell() 
                 master_key_id: None,
                 identify: false,
                 verify_only: false,
+                entries: Vec::new(),
+                preview: false,
+                from_preview: false,
             })
             .unwrap();
         answer_until(&emu, true, || {
@@ -717,6 +907,9 @@ fn one_seed_on_two_shells_is_one_wallet_and_signs_through_the_remaining_shell() 
             master_key_id: Some("different-root".into()),
             identify: false,
             verify_only: false,
+            entries: Vec::new(),
+            preview: false,
+            from_preview: false,
         })
         .unwrap();
     answer_until(&emu, true, || {
@@ -736,6 +929,7 @@ fn one_seed_on_two_shells_is_one_wallet_and_signs_through_the_remaining_shell() 
                 message: hex::encode("remaining Shell"),
             },
             secret: None,
+            xpub: None,
         })
         .unwrap();
     answer_until(&emu, true, || shell.status(&job).unwrap().state.is_final());
@@ -761,6 +955,7 @@ fn a_public_offer_uses_an_unregistered_shell_without_importing_or_reexporting_th
             message: hex::encode(b"routing test"),
         },
         secret: None,
+        xpub: None,
     };
     let job = target.shell.sign_offered(request(), offer.clone()).unwrap();
     assert_eq!(settle(&mut target, &job, true).state, JobState::Done);
@@ -830,6 +1025,7 @@ fn a_different_seed_is_skipped_but_a_refusal_ends_verification() {
                         message: hex::encode("two connections"),
                     },
                     secret: None,
+                    xpub: None,
                 },
                 offer,
             )
@@ -931,6 +1127,7 @@ fn root_verification_is_per_attachment_and_never_persisted() {
             message: hex::encode("session test"),
         },
         secret: None,
+        xpub: None,
     };
     let attempt = |target: &mut ShellSigner| {
         let job = target.sign_offered(request(), offer.clone()).unwrap();
@@ -1028,6 +1225,7 @@ fn refused_verification_is_not_cached() {
                         message: hex::encode("no"),
                     },
                     secret: None,
+                    xpub: None,
                 },
                 offer.clone(),
             )
@@ -1086,6 +1284,9 @@ fn manual_verification_replaces_the_cache_without_changing_saved_wallets() {
                 master_key_id: Some(root.clone()),
                 identify: false,
                 verify_only: true,
+                entries: Vec::new(),
+                preview: false,
+                from_preview: false,
             })
             .unwrap();
         answer_until(&emu, true, || {
@@ -1132,5 +1333,155 @@ fn manual_verification_replaces_the_cache_without_changing_saved_wallets() {
         target.wallet_groups(),
         before,
         "verification must not import or regroup a different wallet"
+    );
+}
+
+/// The phrase's own key at `m/1280263247'/n'`, as any other holder of it gives.
+fn phrase_unlock_key(phrase: &str, n: u32) -> String {
+    use bitcoin::bip32::{DerivationPath, Xpriv, Xpub};
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let seed = bip39_seed(phrase);
+    let master = Xpriv::new_master(bitcoin::NetworkKind::Test, &seed).unwrap();
+    let path = DerivationPath::from_str(&format!("m/1280263247'/{n}'")).unwrap();
+    hex::encode(
+        Xpub::from_priv(&secp, &master.derive_priv(&secp, &path).unwrap())
+            .public_key
+            .serialize(),
+    )
+}
+
+fn bip39_seed(phrase: &str) -> [u8; 64] {
+    let mut seed = [0u8; 64];
+    pbkdf2::pbkdf2_hmac::<sha2::Sha512>(phrase.as_bytes(), b"mnemonic", 2048, &mut seed);
+    seed
+}
+
+#[test]
+fn the_shell_gives_its_phrases_unlock_key_once_its_person_confirms() {
+    let mut rig = rig_with(Store::new());
+    let added = add(&rig, vec![Family::Evm], Chain::Test);
+    let seed = added[0]
+        .seed
+        .clone()
+        .expect("an added account names its seed");
+    assert_eq!(
+        rig.shell.accounts().unwrap()[0].seed.as_deref(),
+        Some(seed.as_str())
+    );
+
+    let job = rig
+        .shell
+        .unlock_key(UnlockKeyRequest {
+            seed: seed.clone(),
+            index: 1,
+            secret: None,
+        })
+        .unwrap();
+    assert_eq!(
+        rig.shell.unlock_key_status(&job).unwrap().state,
+        JobState::ConfirmOnDevice
+    );
+    answer_until(&rig.emu, true, || {
+        rig.shell.unlock_key_status(&job).unwrap().state.is_final()
+    });
+    assert_eq!(
+        rig.shell.unlock_key_result(&job).unwrap().key.expose(),
+        phrase_unlock_key(PHRASE, 1)
+    );
+
+    // Declined on the Shell: refused, and no key.
+    let job = rig
+        .shell
+        .unlock_key(UnlockKeyRequest {
+            seed,
+            index: 0,
+            secret: None,
+        })
+        .unwrap();
+    answer_until(&rig.emu, false, || {
+        rig.shell.unlock_key_status(&job).unwrap().state.is_final()
+    });
+    assert_eq!(
+        rig.shell.unlock_key_status(&job).unwrap().state,
+        JobState::Refused
+    );
+    let foreign = rig.shell.unlock_key(UnlockKeyRequest {
+        seed: "00".repeat(32),
+        index: 0,
+        secret: None,
+    });
+    assert_eq!(foreign.unwrap_err().code, ErrorCode::WrongSeed);
+}
+
+#[test]
+fn a_locked_wallet_still_gives_its_unlock_key() {
+    let dir = std::env::temp_dir().join(format!(
+        "shell-locked-key-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let rig = rig_with(Store::open(&dir).unwrap());
+    let seed = add(&rig, vec![Family::Evm], Chain::Test)[0]
+        .seed
+        .clone()
+        .expect("an added account names its seed");
+    unlock_all(&rig);
+    drop(rig);
+    // After a restart the wallet is locked: no account listed, its seed known.
+    let mut rig = rig_with(Store::open(&dir).unwrap());
+    assert!(rig.shell.accounts().unwrap().is_empty());
+    let job = rig
+        .shell
+        .unlock_key(UnlockKeyRequest {
+            seed,
+            index: 0,
+            secret: None,
+        })
+        .expect("a locked wallet's seed is known");
+    answer_until(&rig.emu, true, || {
+        rig.shell.unlock_key_status(&job).unwrap().state.is_final()
+    });
+    assert_eq!(
+        rig.shell.unlock_key_result(&job).unwrap().key.expose(),
+        phrase_unlock_key(PHRASE, 0)
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_shell_verified_to_hold_another_seed_leaves_this_ones_accounts_unavailable() {
+    let rig = rig_with(Store::new());
+    let added = add(&rig, vec![Family::Evm], Chain::Test);
+    let mut shell = rig.shell;
+    assert!(
+        shell.accounts().unwrap()[0].available,
+        "its own verified Shell is connected"
+    );
+
+    // The same store, with the accounts' seed changed to one the connected Shell doesn't hold.
+    let mut other = Store::new();
+    let theirs: Vec<_> = shell
+        .routing_accounts()
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|v| keycard_shell_module::store::Offered {
+            account: serde_json::from_value(v["account"].clone()).unwrap(),
+            serial: rig.emu.serial(),
+            master_key_id: "11".repeat(32),
+            key: v["key"].as_str().unwrap().into(),
+        })
+        .collect();
+    other
+        .put_identified(theirs, &"11".repeat(32), &rig.emu.serial())
+        .unwrap();
+    shell.set_store(other);
+    let listed = shell.accounts().unwrap();
+    assert_eq!(listed[0].seed.as_deref(), Some("11".repeat(32).as_str()));
+    assert!(
+        !listed[0].available,
+        "the connected Shell is verified to hold {:?}",
+        added[0].seed
     );
 }

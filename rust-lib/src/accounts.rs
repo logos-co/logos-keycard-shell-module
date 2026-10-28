@@ -70,6 +70,8 @@ pub fn evm_account(e: &Exported, label: Option<String>) -> Account {
         fingerprint: Some(hex::encode(e.fingerprint)),
         address: Some(address),
         xpub: None,
+        key: None,
+        seed: None,
         label,
         available: true,
     }
@@ -119,6 +121,8 @@ pub fn bitcoin_account(
         fingerprint: Some(fp),
         address: None,
         xpub: Some(xpub.to_string()),
+        key: None,
+        seed: None,
         label,
         available: true,
     })
