@@ -1,6 +1,6 @@
 {
   "name": "keycard_shell_module",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Keycard Shell signer: the accounts the person offered from a Keycard Shell over USB, and each request signed on the Shell's own screen. Holds no secret.",
   "author": "Logos Core Team",
   "type": "core",
