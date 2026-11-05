@@ -1232,7 +1232,8 @@ impl ShellSigner {
 
     /// The name the person gave a seed's wallet here, by its master key id.
     pub fn own_wallet_name(&self, root: &str) -> Option<String> {
-        Some(lock(&self.s.store).wallet_name(&format!("seed:{root}"))).filter(|n| !n.trim().is_empty())
+        Some(lock(&self.s.store).wallet_name(&format!("seed:{root}")))
+            .filter(|n| !n.trim().is_empty())
     }
 
     /// A seed wallet's name, kept here without sending it on: the person may have given it in

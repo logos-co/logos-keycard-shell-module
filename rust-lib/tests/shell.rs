@@ -731,9 +731,19 @@ fn a_seed_wallet_renamed_here_is_sent_on_and_a_name_taken_from_elsewhere_is_not(
     let sent = Arc::new(Mutex::new(Vec::new()));
     let rig = rig_events(Store::new(), Box::new(Named(sent.clone())));
     add(&rig, vec![Family::Evm], Chain::Main);
-    let id = rig.shell.wallet_groups()[0]["id"].as_str().unwrap().to_owned();
-    let root = id.strip_prefix("seed:").expect("a seed's wallet").to_owned();
-    assert_eq!(rig.shell.own_wallet_name(&root), None, "no name of the person's yet");
+    let id = rig.shell.wallet_groups()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let root = id
+        .strip_prefix("seed:")
+        .expect("a seed's wallet")
+        .to_owned();
+    assert_eq!(
+        rig.shell.own_wallet_name(&root),
+        None,
+        "no name of the person's yet"
+    );
     rig.shell.rename_wallet(&id, " Travel ").unwrap();
     rig.shell.take_wallet_name(&root, "Daily").unwrap();
     assert_eq!(rig.shell.own_wallet_name(&root).as_deref(), Some("Daily"));

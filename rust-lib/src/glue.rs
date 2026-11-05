@@ -139,7 +139,11 @@ fn sync_names(shell: &ShellSigner, sent: &mut HashSet<String>) {
             let _ = tx.send(r);
         },
     );
-    let Some(listed) = rx.recv().ok().and_then(|r| r.ok()).and_then(|r| read_wallets(&r).ok())
+    let Some(listed) = rx
+        .recv()
+        .ok()
+        .and_then(|r| r.ok())
+        .and_then(|r| read_wallets(&r).ok())
     else {
         return;
     };
@@ -147,7 +151,10 @@ fn sync_names(shell: &ShellSigner, sent: &mut HashSet<String>) {
         match step {
             NameStep::Take { seed, name } => {
                 if let Err(e) = shell.take_wallet_name(&seed, &name) {
-                    eprintln!("keycard_shell_module: a wallet's name didn't apply: {}", e.message);
+                    eprintln!(
+                        "keycard_shell_module: a wallet's name didn't apply: {}",
+                        e.message
+                    );
                 }
             }
             NameStep::Send { seed, name } => {
@@ -160,7 +167,10 @@ fn sync_names(shell: &ShellSigner, sent: &mut HashSet<String>) {
 }
 
 fn send_name(seed: &str, name: &str) {
-    let body = NameSeed { seed: seed.into(), name: name.into() };
+    let body = NameSeed {
+        seed: seed.into(),
+        name: name.into(),
+    };
     if let Ok(body) = serde_json::to_string(&body) {
         wallets::WalletsClient::bind(WALLETS).name_seed_async(&body, |_| {});
     }
