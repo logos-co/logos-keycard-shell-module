@@ -4,14 +4,14 @@
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use keycard_shell_module::apdu::{self, ShellError, Transport};
 use keycard_shell_module::commands;
 use keycard_shell_module::emulator::{Confirm, Emulator, PHRASE};
 use keycard_shell_module::link::{Devices, Emulated};
-use keycard_shell_module::signer::{AddEntry, AddRequest, Quiet, ShellSigner};
+use keycard_shell_module::signer::{AddEntry, AddRequest, Events, Quiet, ShellSigner};
 use keycard_shell_module::store::Store;
 use logos_signer_interface::conformance::{self, Fixture};
 use logos_signer_interface::verify::check;
@@ -88,6 +88,10 @@ fn unlock_all(rig: &Rig) {
 }
 
 fn rig_with(store: Store) -> Rig {
+    rig_events(store, Box::new(Quiet))
+}
+
+fn rig_events(store: Store, events: Box<dyn Events>) -> Rig {
     let emu = Emulator::new(PHRASE, Confirm::Manual);
     let addr = emu.listen().unwrap();
     let on = Arc::new(AtomicBool::new(true));
@@ -97,7 +101,7 @@ fn rig_with(store: Store) -> Rig {
         on: on.clone(),
         forbid_public: forbid_public.clone(),
     };
-    let shell = ShellSigner::new(Box::new(devices), store, Box::new(Quiet));
+    let shell = ShellSigner::new(Box::new(devices), store, events);
     Rig {
         emu,
         addr,
@@ -708,6 +712,43 @@ fn additional_evm_accounts_keep_their_path_and_wallet_group() {
     );
     rig.shell.forget_wallet(id).unwrap();
     assert!(rig.shell.wallet_groups().is_empty());
+}
+
+/// Records the names sent on to the signer manager.
+struct Named(Arc<Mutex<Vec<(String, String)>>>);
+
+impl Events for Named {
+    fn sign_progress(&self, _: &str, _: JobState) {}
+    fn accounts_changed(&self, _: usize) {}
+    fn device_changed(&self, _: bool) {}
+    fn seed_named(&self, seed: &str, name: &str) {
+        self.0.lock().unwrap().push((seed.into(), name.into()));
+    }
+}
+
+#[test]
+fn a_seed_wallet_renamed_here_is_sent_on_and_a_name_taken_from_elsewhere_is_not() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let rig = rig_events(Store::new(), Box::new(Named(sent.clone())));
+    add(&rig, vec![Family::Evm], Chain::Main);
+    let id = rig.shell.wallet_groups()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let root = id
+        .strip_prefix("seed:")
+        .expect("a seed's wallet")
+        .to_owned();
+    assert_eq!(
+        rig.shell.own_wallet_name(&root),
+        None,
+        "no name of the person's yet"
+    );
+    rig.shell.rename_wallet(&id, " Travel ").unwrap();
+    rig.shell.take_wallet_name(&root, "Daily").unwrap();
+    assert_eq!(rig.shell.own_wallet_name(&root).as_deref(), Some("Daily"));
+    assert_eq!(rig.shell.wallet_groups()[0]["name"], "Daily");
+    assert_eq!(*sent.lock().unwrap(), vec![(root, "Travel".to_string())]);
 }
 
 #[test]

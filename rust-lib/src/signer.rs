@@ -35,6 +35,8 @@ pub trait Events: Send + Sync {
     /// Accounts of a seed were added, with its unlock key at index 0 when the Shell gave it: the
     /// glue registers the seed with the signer manager.
     fn seed_added(&self, _seed: &str, _unlock_key: Option<[u8; 33]>, _name: &str) {}
+    /// The person renamed a seed's wallet here: the glue gives the name to the signer manager.
+    fn seed_named(&self, _seed: &str, _name: &str) {}
 }
 
 /// Announces nothing, for tests.
@@ -1215,6 +1217,30 @@ impl ShellSigner {
     pub fn rename_wallet(&self, id: &str, name: &str) -> Result<(), SignerError> {
         lock(&self.s.store)
             .rename_wallet(id, name)
+            .map_err(|e| err(ErrorCode::Invalid, e.to_string()))?;
+        self.s
+            .events
+            .accounts_changed(lock(&self.s.store).list().len());
+        // Only a seed's wallet is the manager's; an older one known by the Shell's serial isn't.
+        if let Some(root) = id.strip_prefix("seed:") {
+            if let Some(name) = self.own_wallet_name(root) {
+                self.s.events.seed_named(root, &name);
+            }
+        }
+        Ok(())
+    }
+
+    /// The name the person gave a seed's wallet here, by its master key id.
+    pub fn own_wallet_name(&self, root: &str) -> Option<String> {
+        Some(lock(&self.s.store).wallet_name(&format!("seed:{root}")))
+            .filter(|n| !n.trim().is_empty())
+    }
+
+    /// A seed wallet's name, kept here without sending it on: the person may have given it in
+    /// another app.
+    pub fn take_wallet_name(&self, root: &str, name: &str) -> Result<(), SignerError> {
+        lock(&self.s.store)
+            .rename_wallet(&format!("seed:{root}"), name)
             .map_err(|e| err(ErrorCode::Invalid, e.to_string()))?;
         self.s
             .events

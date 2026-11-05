@@ -73,6 +73,13 @@ app, with the public key at `m/1280263247'/n'`, which every holder of the seed g
   kind: "keycard_shell", unlockKey, name })` through `logos.wallets/1` (`wallets.lidl`), bound to
   `signer_manager_module` at runtime and asked without waiting. A Shell that won't export it still
   adds; its wallet then unlocks by a password.
+- **One name per wallet.** The manager keeps the name every app shows.
+  - Renaming a seed's wallet here (`rename_wallet("seed:<root>", name)`) sends it on with
+    `name_seed({ seed: root, name })`, asked without waiting. An older wallet known by a Shell
+    serial isn't the manager's, so its name stays here.
+  - At start and on each `wallets_changed`, the module reads `wallets()`. It takes the name of each
+    wallet it holds that is `named`, without sending it back, and sends its own name for one not
+    named yet, once a run. The manager allows 64 characters.
 - **`unlock_key`** (`{ seed, index }`, the manager alone) returns a job in `confirm_on_device`.
   - It runs on a connected Shell whose verified root is that seed, and exports the key at
     `m/1280263247'/<index>'` once its person confirms.
