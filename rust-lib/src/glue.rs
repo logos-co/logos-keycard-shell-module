@@ -14,7 +14,8 @@ use crate::link;
 use crate::signer::{AddRequest, Events, ShellSigner};
 use crate::store::Store;
 use logos_signer_interface::wallets::{
-    name_steps, read_data_key, read_wallets, DataKey, DataKeyRequest, NameSeed, NameStep,
+    name_steps, read_data_key, read_forgotten, read_wallets, DataKey, DataKeyRequest, ForgetSeed,
+    NameSeed, NameStep, Wallet,
 };
 
 pub trait KeycardShellModule: Send + Sync + 'static {
@@ -84,6 +85,9 @@ impl Events for Emit {
     fn seed_named(&self, seed: &str, name: &str) {
         send_name(seed, name);
     }
+    fn seed_forgotten(&self, seed: &str) {
+        forget_seed(seed);
+    }
     fn sign_progress(&self, job: &str, state: JobState) {
         emit_sign_progress(job, state.as_str());
     }
@@ -108,13 +112,13 @@ fn watch_wallets(shell: ShellSigner) {
     let locked = client.on_wallets_locked();
     let s = shell.clone();
     std::thread::spawn(move || {
-        let mut sent = HashSet::new();
+        let (mut sent, mut forgot) = (HashSet::new(), HashSet::new());
         open_wallets(&s);
-        sync_names(&s, &mut sent);
+        sync_wallets(&s, &mut sent, &mut forgot);
         if let Ok(sub) = changed {
             for _ in sub {
                 open_wallets(&s);
-                sync_names(&s, &mut sent);
+                sync_wallets(&s, &mut sent, &mut forgot);
             }
         }
     });
@@ -129,9 +133,9 @@ fn watch_wallets(shell: ShellSigner) {
     }
 }
 
-/// One name per wallet: take the name the person gave in any app, and send one given here while
-/// the wallet has none, once a run.
-fn sync_names(shell: &ShellSigner, sent: &mut HashSet<String>) {
+/// The manager's wallets, read once a change: a wallet forgotten here before the manager heard of
+/// it is forgotten there, once a run, and the others' names brought together.
+fn sync_wallets(shell: &ShellSigner, sent: &mut HashSet<String>, forgot: &mut HashSet<String>) {
     let (tx, rx) = std::sync::mpsc::channel();
     wallets::WalletsClient::bind(WALLETS).wallets_async_with_timeout(
         Duration::from_secs(10),
@@ -139,7 +143,7 @@ fn sync_names(shell: &ShellSigner, sent: &mut HashSet<String>) {
             let _ = tx.send(r);
         },
     );
-    let Some(listed) = rx
+    let Some(mut listed) = rx
         .recv()
         .ok()
         .and_then(|r| r.ok())
@@ -147,7 +151,24 @@ fn sync_names(shell: &ShellSigner, sent: &mut HashSet<String>) {
     else {
         return;
     };
-    for step in name_steps(&listed, |root| shell.own_wallet_name(root)) {
+    let stale = shell.stale_wallets(&listed);
+    for seed in &stale {
+        if forgot.insert(seed.clone()) {
+            forget_seed(seed);
+        }
+    }
+    listed.retain(|w| {
+        !w.holder_seed
+            .as_deref()
+            .is_some_and(|s| stale.iter().any(|g| g == s.trim()))
+    });
+    sync_names(shell, &listed, sent);
+}
+
+/// One name per wallet: take the name the person gave in any app, and send one given here while
+/// the wallet has none, once a run.
+fn sync_names(shell: &ShellSigner, listed: &[Wallet], sent: &mut HashSet<String>) {
+    for step in name_steps(listed, |root| shell.own_wallet_name(root)) {
         match step {
             NameStep::Take { seed, name } => {
                 if let Err(e) = shell.take_wallet_name(&seed, &name) {
@@ -174,6 +195,22 @@ fn send_name(seed: &str, name: &str) {
     if let Ok(body) = serde_json::to_string(&body) {
         wallets::WalletsClient::bind(WALLETS).name_seed_async(&body, |_| {});
     }
+}
+
+/// This module no longer holds the seed: the manager drops it, and the wallet with no holder
+/// left. Asked without waiting; a refusal is only logged.
+fn forget_seed(seed: &str) {
+    let Ok(body) = serde_json::to_string(&ForgetSeed { seed: seed.into() }) else {
+        return;
+    };
+    wallets::WalletsClient::bind(WALLETS).forget_seed_async(&body, |r| {
+        let forgotten = r
+            .map_err(|e| e.to_string())
+            .and_then(|r| read_forgotten(&r).map_err(|e| e.message));
+        if let Err(e) = forgotten {
+            eprintln!("keycard_shell_module: the signer manager didn't forget a wallet: {e}");
+        }
+    });
 }
 
 /// Every closed seed's key; a locked one answers `locked` and stays closed.

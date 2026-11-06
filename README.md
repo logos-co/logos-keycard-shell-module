@@ -37,7 +37,8 @@ Licensed under MIT or Apache-2.0.
 
 Use `keycard_ui` for USB and reader wallets; the standalone Shell UI is superseded.
 `wallet_groups`, `rename_wallet(id, name)` and `forget_wallet(id)` manage local USB wallets. A seed
-wallet's name is shared with the signer manager, so every app shows the same one.
+wallet's name is shared with the signer manager, so every app shows the same one. A seed wallet
+forgotten here leaves the signer manager too (`forget_seed`), so the Signer app stops listing it.
 The group key is `seed:<SHA256(SEC1-uncompressed-master-public-key)>`, matching the reader
 module's Keycard key UID. USB serials are connection metadata, independent of wallet identity.
 Each seed's wallet (its accounts, name, aliases and Shell serials) is kept in

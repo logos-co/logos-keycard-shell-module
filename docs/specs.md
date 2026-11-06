@@ -80,6 +80,15 @@ app, with the public key at `m/1280263247'/n'`, which every holder of the seed g
   - At start and on each `wallets_changed`, the module reads `wallets()`. It takes the name of each
     wallet it holds that is `named`, without sending it back, and sends its own name for one not
     named yet, once a run. The manager allows 64 characters.
+- **A wallet forgotten here leaves the signer manager.** `forget_wallet("seed:<root>")` sends
+  `forget_seed({ seed: root })` (`logos.wallets/1`) once the wallet is gone from disk, asked without
+  waiting. The manager drops this holder, and the wallet once no holder is left. A failed forget
+  sends nothing, a refusal is only logged, and an older wallet known by a Shell serial sends nothing.
+  - On each read of `wallets()`, the module also forgets, once a run, each wallet the manager lists
+    it holding that it no longer has, sealed, open or waiting. So a wallet forgotten before this
+    goes too.
+  - Only a store read from an earlier run's `accounts.sealed.json` counts. One that failed to load,
+    or found no file, forgets nothing.
 - **`unlock_key`** (`{ seed, index }`, the manager alone) returns a job in `confirm_on_device`.
   - It runs on a connected Shell whose verified root is that seed, and exports the key at
     `m/1280263247'/<index>'` once its person confirms.
@@ -161,7 +170,7 @@ For the Shell's app:
   identified), with their accounts, aliases and connections: `{ ok, groups }`.
 - `rename_wallet`: `(id, name)` → `{ ok }`; at most 80 characters, no control characters.
 - `forget_wallet`: `(id)` → `{ ok }`, removing the wallet's saved accounts, name, aliases and
-  connections. Nothing on the Shell changes.
+  connections, and a seed's wallet from the signer manager too. Nothing on the Shell changes.
 
 Who may call which comes from module identity in the new core.
 
