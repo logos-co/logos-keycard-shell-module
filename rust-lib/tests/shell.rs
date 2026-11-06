@@ -751,6 +751,83 @@ fn a_seed_wallet_renamed_here_is_sent_on_and_a_name_taken_from_elsewhere_is_not(
     assert_eq!(*sent.lock().unwrap(), vec![(root, "Travel".to_string())]);
 }
 
+/// Records the seeds the signer manager is told to forget.
+struct Forgot(Arc<Mutex<Vec<String>>>);
+
+impl Events for Forgot {
+    fn sign_progress(&self, _: &str, _: JobState) {}
+    fn accounts_changed(&self, _: usize) {}
+    fn device_changed(&self, _: bool) {}
+    fn seed_forgotten(&self, seed: &str) {
+        self.0.lock().unwrap().push(seed.into());
+    }
+}
+
+/// The manager's `wallets()` listing this module holding `held`, and another holder's wallet.
+fn listed(held: &[&str]) -> Vec<logos_signer_interface::wallets::Wallet> {
+    let mut wallets: Vec<_> = held
+        .iter()
+        .map(|s| serde_json::json!({ "seed": format!("w_{s}"), "name": s, "locked": true, "holderSeed": s }))
+        .collect();
+    wallets.push(serde_json::json!({ "seed": "w_other", "name": "Keycard", "locked": false }));
+    let reply = serde_json::json!({ "ok": true, "wallets": wallets }).to_string();
+    logos_signer_interface::wallets::read_wallets(&reply).unwrap()
+}
+
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "shell-{name}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+#[test]
+fn a_seed_wallet_forgotten_here_is_forgotten_in_the_manager() {
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let rig = rig_events(Store::new(), Box::new(Forgot(told.clone())));
+    add(&rig, vec![Family::Evm], Chain::Main);
+    let id = rig.shell.wallet_groups()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let root = id
+        .strip_prefix("seed:")
+        .expect("a seed's wallet")
+        .to_owned();
+    // A wallet the store doesn't have isn't the manager's business.
+    assert!(rig.shell.forget_wallet("seed:00").is_err());
+    assert!(told.lock().unwrap().is_empty());
+    rig.shell.forget_wallet(&id).unwrap();
+    assert_eq!(*told.lock().unwrap(), vec![root]);
+}
+
+#[test]
+fn stale_wallets_are_the_held_ones_the_store_no_longer_has() {
+    let dir = scratch("stale");
+    let rig = rig_with(Store::open(&dir).unwrap());
+    add(&rig, vec![Family::Evm], Chain::Main);
+    unlock_all(&rig);
+    let id = rig.shell.wallet_groups()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let root = id.strip_prefix("seed:").unwrap();
+    let all = listed(&[root, "gone", " spaced "]);
+    // Sealed and locked, it is still had.
+    let reopened = Store::open(&dir).unwrap();
+    assert_eq!(reopened.stale(&all), vec!["gone", "spaced"]);
+    let rig = rig_with(reopened);
+    assert_eq!(rig.shell.stale_wallets(&all), vec!["gone", "spaced"]);
+    // A store read from no file, or kept in memory, forgets nothing.
+    let empty = scratch("stale-empty");
+    assert!(Store::open(&empty).unwrap().stale(&all).is_empty());
+    assert!(Store::new().stale(&all).is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn wallet_names_and_empty_wallets_survive_reload() {
     let dir = std::env::temp_dir().join(format!(

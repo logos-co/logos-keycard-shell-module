@@ -12,7 +12,7 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::Psbt;
 use logos_signer_interface::jobs::{JobTable, KeyJobs};
 use logos_signer_interface::unlock::{evm_path_ok, is_reserved, roster_key, PURPOSE};
-use logos_signer_interface::wallets::DataKey;
+use logos_signer_interface::wallets::{DataKey, Wallet};
 use logos_signer_interface::{
     Account, Chain, Collects, ErrorCode, Family, JobState, JobStatus, Payload, RequestKind, Secret,
     SignRequest, Signature, Signer, SignerError, SignerInfo, UnlockKey, UnlockKeyRequest,
@@ -37,6 +37,8 @@ pub trait Events: Send + Sync {
     fn seed_added(&self, _seed: &str, _unlock_key: Option<[u8; 33]>, _name: &str) {}
     /// The person renamed a seed's wallet here: the glue gives the name to the signer manager.
     fn seed_named(&self, _seed: &str, _name: &str) {}
+    /// A seed's wallet was forgotten here: the glue tells the signer manager.
+    fn seed_forgotten(&self, _seed: &str) {}
 }
 
 /// Announces nothing, for tests.
@@ -1262,7 +1264,16 @@ impl ShellSigner {
         self.s
             .events
             .accounts_changed(lock(&self.s.store).list().len());
-        result
+        if let Some(seed) = result? {
+            self.s.events.seed_forgotten(&seed);
+        }
+        Ok(())
+    }
+
+    /// The wallets the signer manager still lists this module holding, forgotten here before it
+    /// could hear of it: each one to forget there too.
+    pub fn stale_wallets(&self, listed: &[Wallet]) -> Vec<String> {
+        lock(&self.s.store).stale(listed)
     }
 
     pub fn origins(&self) -> serde_json::Value {
