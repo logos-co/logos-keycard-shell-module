@@ -183,6 +183,36 @@ fn gone(e: hidapi::HidError) -> ShellError {
     ))
 }
 
+/// Whether an open failure is the OS refusing access to the device (EACCES) rather than a Shell
+/// that has left. hidapi's Linux backend hands that over as text only (`failed to open device with
+/// path ...: Permission denied (os error 13)`), so the errno in the text is what there is to go by.
+#[cfg(any(feature = "hid", test))]
+fn is_permission_denied(failure: &str) -> bool {
+    failure.contains("(os error 13)")
+}
+
+/// A Shell that is plugged in, on and unlocked, which this user may not open.
+#[cfg(any(feature = "hid", test))]
+fn no_permission(cause: &str) -> ShellError {
+    ShellError::Link(format!(
+        "can't access the Keycard Shell: this user has no permission to open its USB device. On Linux that takes a udev rule for USB ID 1209:21f7; add one and re-plug the Shell ({cause})"
+    ))
+}
+
+/// Why opening a Shell failed: no permission, or the Shell has left.
+#[cfg(feature = "hid")]
+fn open_failed(e: hidapi::HidError) -> ShellError {
+    let denied = match &e {
+        hidapi::HidError::IoError { error } => error.kind() == std::io::ErrorKind::PermissionDenied,
+        other => is_permission_denied(&other.to_string()),
+    };
+    if denied {
+        no_permission(&e.to_string())
+    } else {
+        gone(e)
+    }
+}
+
 #[cfg(feature = "hid")]
 impl Frames for HidFrames {
     fn write(&mut self, frame: &[u8; FRAME]) -> Result<()> {
@@ -238,7 +268,7 @@ impl Devices for Usb {
         let path = std::ffi::CString::new(token)
             .map_err(|_| ShellError::Link("invalid USB path".into()))?;
         self.with_api(|api| {
-            let device = api.open_path(&path).map_err(gone)?;
+            let device = api.open_path(&path).map_err(open_failed)?;
             Ok(Box::new(Link::new(HidFrames(device))) as Box<dyn Transport>)
         })
     }
@@ -261,5 +291,27 @@ pub fn from_env() -> Box<dyn Devices> {
         _ => Box::new(Usb::new()),
         #[cfg(not(feature = "hid"))]
         _ => Box::new(Emulated::new("")),
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_open_is_told_apart_from_a_shell_that_left() {
+        let refused = "hidapi error: failed to open device with path /dev/hidraw14: Permission denied (os error 13)";
+        let unplugged = "hidapi error: failed to open device with path /dev/hidraw14: No such file or directory (os error 2)";
+        assert!(is_permission_denied(refused));
+        assert!(!is_permission_denied(unplugged));
+    }
+
+    #[test]
+    fn a_refused_open_does_not_send_the_person_to_power_cycle_the_shell() {
+        let ShellError::Link(text) = no_permission("os error 13") else {
+            panic!("not a link error");
+        };
+        assert!(text.contains("permission"));
+        assert!(!text.contains("turns itself off"));
     }
 }
