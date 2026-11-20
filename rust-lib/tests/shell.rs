@@ -1603,3 +1603,72 @@ fn a_shell_verified_to_hold_another_seed_leaves_this_ones_accounts_unavailable()
         added[0].seed
     );
 }
+
+#[test]
+fn a_preview_of_five_evm_addresses_asks_three_times_and_derives_them_right() {
+    let rig = rig_with(Store::new());
+    let entries = (0..5)
+        .map(|i| AddEntry {
+            family: Family::Evm,
+            account: i,
+            chain: None,
+            label: None,
+        })
+        .collect();
+    let job = rig
+        .shell
+        .add_accounts(AddRequest {
+            families: Vec::new(),
+            chain: Chain::Main,
+            account: 0,
+            label: None,
+            entries,
+            preview: true,
+            from_preview: false,
+            serial: None,
+            fingerprint: None,
+            master_key_id: None,
+            identify: false,
+            verify_only: false,
+        })
+        .unwrap();
+    let mut asked = Vec::new();
+    let start = Instant::now();
+    let shown = loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "the Shell kept waiting"
+        );
+        if let Some(what) = rig.emu.asking() {
+            asked.push(what);
+            rig.emu.press(true);
+        }
+        match rig.shell.add_status(&job) {
+            Some(a) if a.state == "done" => break a.accounts,
+            Some(a) if a.state == "failed" => panic!("{:?}", a.error),
+            _ => std::thread::sleep(Duration::from_millis(5)),
+        }
+    };
+    // The root, the EVM parent xpub and the seed's unlock key: not one a key.
+    assert_eq!(asked.len(), 3, "{asked:?}");
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let master = keycard_shell_module::emulator::master_from_phrase(PHRASE);
+    for (i, account) in shown.iter().enumerate() {
+        let path = format!("m/44'/60'/0'/0/{i}");
+        let key = master
+            .derive_priv(
+                &secp,
+                &bitcoin::bip32::DerivationPath::from_str(&path).unwrap(),
+            )
+            .unwrap()
+            .private_key
+            .public_key(&secp);
+        let hash = Keccak256::digest(&key.serialize_uncompressed()[1..]);
+        assert_eq!(
+            account.id,
+            format!("0x{}", hex::encode(&hash[12..])),
+            "{path}"
+        );
+        assert_eq!(account.path.as_deref(), Some(path.as_str()));
+    }
+}

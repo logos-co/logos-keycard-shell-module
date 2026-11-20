@@ -39,7 +39,11 @@ own client sends them.
 The Shell's app asks for the accounts the person chooses (`add_accounts`). The person confirms each
 key on the Shell before it is exported:
 
-- **EVM**: `m/44'/60'/0'/0/0`. Its id is its address, in lowercase.
+- **EVM**: `m/44'/60'/0'/0/<account>`. Its id is its address, in lowercase. The Shell exports the
+  xpub at `m/44'/60'/0'/0` once a connection, and the module derives each address from it, so any
+  number of addresses costs one confirmation. Identifying a wallet compares its saved EVM keys the
+  same way. The xpub stays in memory for that connection only: it links every address of the seed.
+  The person can check an address on the Shell itself, with its Verify address menu.
 - **Native segwit** and **taproot**: `m/84'` or `m/86'`, then `0'` for Bitcoin or `1'` for the test
   networks, then the account. The account key and its parent key are both exported. The parent is
   needed for the fingerprint the xpub carries, since GET PUBLIC doesn't give it. That makes two
