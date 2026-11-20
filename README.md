@@ -25,10 +25,12 @@ The tests and the doctest run against `keycard-shell-emulator`, written from the
 v1.4.0's source. Set `KEYCARD_SHELL_EMULATOR=host:port` to point the module at it. A real Shell is
 tested by hand, as the reference describes.
 
-On Linux, give your user the Shell's HID device, for instance:
+On Linux the Shell's HID device is root-only until a udev rule gives it to the logged-in user.
+Install [`linux/70-keycard-shell.rules`](linux/70-keycard-shell.rules), then re-plug the Shell:
 
 ```
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="21f7", TAG+="uaccess"
+sudo cp linux/70-keycard-shell.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
 ```
 
 Licensed under MIT or Apache-2.0.
