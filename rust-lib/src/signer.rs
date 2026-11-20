@@ -206,6 +206,8 @@ struct ConnectionSession {
     token: String,
     epoch: u64,
     root: Option<commands::Exported>,
+    /// The xpub at m/44'/60'/0'/0, for this connection only: it links every EVM address.
+    evm: Option<commands::Exported>,
 }
 
 struct Shared {
@@ -479,6 +481,7 @@ impl Shared {
                     token,
                     epoch: self.seq.fetch_add(1, Ordering::SeqCst),
                     root: None,
+                    evm: None,
                 }
             });
         }
@@ -557,6 +560,35 @@ impl Shared {
         drop(sessions);
         self.events.accounts_changed(lock(&self.store).list().len());
         Ok(root)
+    }
+
+    /// An EVM receive key, derived from its parent's xpub: one confirmation a connection, not one a key.
+    fn evm_key(
+        &self,
+        serial: &str,
+        epoch: u64,
+        t: &mut dyn crate::apdu::Transport,
+        index: u32,
+    ) -> Result<commands::Exported, SignerError> {
+        let cached = lock(&self.sessions)
+            .get(serial)
+            .filter(|s| s.epoch == epoch)
+            .and_then(|s| s.evm.clone());
+        let parent = match cached {
+            Some(p) => p,
+            None => {
+                let p = commands::get_public(t, &accounts::EVM_PARENT, true)
+                    .map_err(|e| self.connection_error(serial, epoch, e, false))?;
+                if let Some(s) = lock(&self.sessions)
+                    .get_mut(serial)
+                    .filter(|s| s.epoch == epoch)
+                {
+                    s.evm = Some(p.clone());
+                }
+                p
+            }
+        };
+        accounts::evm_leaf(&parent, index).map_err(|e| err(ErrorCode::Internal, e))
     }
 
     fn run(&self, offered: &Offered, work: Work, job: &str) -> Result<Vec<Signature>, SignerError> {
@@ -720,7 +752,12 @@ impl Shared {
             };
             let path = parse_path(path)
                 .ok_or_else(|| err(ErrorCode::Invalid, "Invalid saved account path"))?;
-            let key = commands::get_public(t, &path, false).map_err(shell)?;
+            let key = match path.split_last() {
+                Some((&i, parent)) if parent == accounts::EVM_PARENT => {
+                    self.evm_key(serial, epoch, t, i)?
+                }
+                _ => commands::get_public(t, &path, false).map_err(shell)?,
+            };
             if hex::encode(key.key.serialize()) == o.key {
                 o.master_key_id = root_id.clone();
                 out.push(o);
@@ -738,7 +775,7 @@ impl Shared {
                 Family::Evm => {
                     let mut path = accounts::EVM_PATH;
                     path[4] = index;
-                    let e = commands::get_public(t, &path, false).map_err(shell)?;
+                    let e = self.evm_key(serial, epoch, t, index)?;
                     let mut account = accounts::evm_account(&e, label);
                     account.path = Some(accounts::path_string(&path));
                     Offered {

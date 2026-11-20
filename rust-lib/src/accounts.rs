@@ -11,6 +11,36 @@ use crate::commands::Exported;
 
 pub const HARDENED: u32 = 0x8000_0000;
 
+/// m/44'/60'/0'/0: the EVM receive keys' parent, whose xpub derives every one of them here.
+pub const EVM_PARENT: [u32; 4] = [HARDENED | 44, HARDENED | 60, HARDENED, 0];
+
+/// The EVM receive key at `index`, derived from the xpub at [`EVM_PARENT`].
+pub fn evm_leaf(parent: &Exported, index: u32) -> Result<Exported, String> {
+    let chain_code = parent
+        .chain_code
+        .ok_or("the EVM parent key came without its chain code")?;
+    let xpub = Xpub {
+        network: NetworkKind::Main,
+        depth: 4,
+        parent_fingerprint: Fingerprint::default(),
+        child_number: ChildNumber::from_normal_idx(0).expect("0 is normal"),
+        public_key: parent.key,
+        chain_code: ChainCode::from(chain_code),
+    };
+    let child = ChildNumber::from_normal_idx(index).map_err(|e| e.to_string())?;
+    let leaf = xpub
+        .derive_pub(
+            &bitcoin::secp256k1::Secp256k1::verification_only(),
+            &[child],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(Exported {
+        fingerprint: parent.fingerprint,
+        key: leaf.public_key,
+        chain_code: None,
+    })
+}
+
 /// m/44'/60'/0'/0/0, the first EVM address.
 pub const EVM_PATH: [u32; 5] = [HARDENED | 44, HARDENED | 60, HARDENED, 0, 0];
 
