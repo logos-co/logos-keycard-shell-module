@@ -401,7 +401,18 @@ impl Store {
     /// Forget a wallet here. Its seed, when it was a seed's and nothing of it is left: to forget in
     /// the signer manager.
     pub fn forget_wallet(&mut self, id: &str) -> std::io::Result<Option<String>> {
-        if !self.wallet_names.contains_key(id) {
+        let seed = id.strip_prefix("seed:");
+        // A wallet shows from any of: a saved name, a connection/alias, an offered account, or a
+        // sealed-but-locked document (see `closed()`). Forget it if it is known by ANY of these, not
+        // only by a saved name — otherwise a locked wallet whose card was reset, which has only a
+        // sealed doc, can never be removed.
+        let has_doc = seed.is_some_and(|s| self.docs.seeds().iter().any(|x| x == s));
+        let known = self.wallet_names.contains_key(id)
+            || self.connections.contains_key(id)
+            || self.aliases.contains_key(id)
+            || self.offered.iter().any(|o| wallet_id(o) == id)
+            || has_doc;
+        if !known {
             return Err(std::io::Error::other("Unknown wallet"));
         }
         let previous = self.snapshot();
@@ -409,11 +420,17 @@ impl Store {
         self.wallet_names.remove(id);
         self.aliases.remove(id);
         self.connections.remove(id);
+        // `save()` only drops *readable* documents, so a sealed (locked) wallet's document must be
+        // removed explicitly here, or it re-appears from `closed()`.
+        if has_doc {
+            if let Some(s) = seed {
+                self.docs.remove(s).map_err(io)?;
+            }
+        }
         if let Err(e) = self.save() {
             self.restore(previous);
             return Err(e);
         }
-        let seed = id.strip_prefix("seed:");
         if let Some(seed) = seed {
             self.waiting.remove(seed);
         }
