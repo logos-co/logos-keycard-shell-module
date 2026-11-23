@@ -138,6 +138,12 @@ impl Emulator {
         self.state().confirm = confirm;
     }
 
+    /// Load another seed on the same device: the serial and the connection stay, as when a person
+    /// restores a different phrase on a Shell that stays plugged in.
+    pub fn load_phrase(&self, phrase: &str) {
+        self.state().master = master_from_phrase(phrase);
+    }
+
     pub fn serial(&self) -> String {
         hex::encode(&self.state().uid[..15])
     }

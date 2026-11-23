@@ -526,6 +526,7 @@ impl Shared {
                 .filter(|s| s.epoch == epoch)
             {
                 session.root = None;
+                session.evm = None;
             }
         }
         shell_error(error, psbt)
@@ -1075,6 +1076,7 @@ impl ShellSigner {
         if req.verify_only {
             if let Some(session) = lock(&self.s.sessions).get_mut(&serial) {
                 session.root = None;
+                session.evm = None;
             }
             self.s
                 .events
