@@ -1672,3 +1672,88 @@ fn a_preview_of_five_evm_addresses_asks_three_times_and_derives_them_right() {
         assert_eq!(account.path.as_deref(), Some(path.as_str()));
     }
 }
+
+/// The EVM address at m/44'/60'/0'/0/<index> of `phrase`, derived independently of the module.
+fn evm_address(phrase: &str, index: u32) -> String {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let master = keycard_shell_module::emulator::master_from_phrase(phrase);
+    let path = format!("m/44'/60'/0'/0/{index}");
+    let key = master
+        .derive_priv(
+            &secp,
+            &bitcoin::bip32::DerivationPath::from_str(&path).unwrap(),
+        )
+        .unwrap()
+        .private_key
+        .public_key(&secp);
+    let hash = Keccak256::digest(&key.serialize_uncompressed()[1..]);
+    format!("0x{}", hex::encode(&hash[12..]))
+}
+
+#[test]
+fn after_a_verify_a_shell_holding_another_seed_derives_evm_addresses_from_that_seed() {
+    const OTHER: &str =
+        "legal winner thank year wave sausage worth useful legal winner thank yellow";
+    let rig = rig_with(Store::new());
+    let preview = |rig: &Rig| {
+        let job = rig
+            .shell
+            .add_accounts(AddRequest {
+                families: Vec::new(),
+                chain: Chain::Main,
+                account: 0,
+                label: None,
+                entries: vec![AddEntry {
+                    family: Family::Evm,
+                    account: 0,
+                    chain: None,
+                    label: None,
+                }],
+                preview: true,
+                from_preview: false,
+                serial: None,
+                fingerprint: None,
+                master_key_id: None,
+                identify: false,
+                verify_only: false,
+            })
+            .unwrap();
+        answer_until(&rig.emu, true, || {
+            rig.shell
+                .add_status(&job)
+                .is_some_and(|a| a.state == "done" || a.state == "failed")
+        });
+        let a = rig.shell.add_status(&job).unwrap();
+        assert_eq!(a.state, "done", "{:?}", a.error);
+        a.accounts
+    };
+    assert_eq!(preview(&rig)[0].id, evm_address(PHRASE, 0));
+
+    // Same Shell, same USB connection, another seed restored on it; the person asks to verify.
+    rig.emu.load_phrase(OTHER);
+    let job = rig
+        .shell
+        .add_accounts(AddRequest {
+            families: Vec::new(),
+            chain: Chain::Main,
+            account: 0,
+            label: None,
+            entries: Vec::new(),
+            preview: false,
+            from_preview: false,
+            serial: Some(rig.emu.serial()),
+            fingerprint: None,
+            master_key_id: None,
+            identify: false,
+            verify_only: true,
+        })
+        .unwrap();
+    answer_until(&rig.emu, true, || {
+        rig.shell
+            .add_status(&job)
+            .is_some_and(|a| a.state == "done" || a.state == "failed")
+    });
+
+    // A verify re-reads the Shell's keys: the EVM parent xpub must not outlive the root it came with.
+    assert_eq!(preview(&rig)[0].id, evm_address(OTHER, 0));
+}
