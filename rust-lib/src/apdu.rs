@@ -13,7 +13,9 @@ pub const GET_RESPONSE: u8 = 0xc0;
 /// Why the Shell, or the link to it, gave no answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShellError {
-    /// 0x6982: the person declined on the Shell.
+    /// 0x6982: the person declined on the Shell, or the Shell wasn't on a screen that takes
+    /// requests. Its firmware cancels a request it can't show, at once and with this same word
+    /// (`core_wait_event` with `accept_usb` off), so the two can't be told apart from here.
     Denied,
     /// 0x6985: not now, such as with no card inserted or the card locked.
     Conditions,
@@ -33,7 +35,10 @@ pub enum ShellError {
 impl std::fmt::Display for ShellError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ShellError::Denied => f.write_str("declined on the Keycard Shell"),
+            ShellError::Denied => f.write_str(
+                "the Keycard Shell refused: declined on its screen, or it wasn't on its main \
+                 screen. Go to its main screen and try again",
+            ),
             ShellError::Conditions => {
                 f.write_str("the Keycard Shell can't do this now: is its card in and unlocked?")
             }
