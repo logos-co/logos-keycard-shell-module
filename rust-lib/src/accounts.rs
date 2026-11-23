@@ -27,7 +27,8 @@ pub fn evm_leaf(parent: &Exported, index: u32) -> Result<Exported, String> {
         public_key: parent.key,
         chain_code: ChainCode::from(chain_code),
     };
-    let child = ChildNumber::from_normal_idx(index).map_err(|e| e.to_string())?;
+    let child = ChildNumber::from_normal_idx(index)
+        .map_err(|_| format!("EVM address index {index} is out of range (0 to 2147483647)"))?;
     let leaf = xpub
         .derive_pub(
             &bitcoin::secp256k1::Secp256k1::verification_only(),
