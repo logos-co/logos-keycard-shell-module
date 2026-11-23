@@ -200,9 +200,9 @@ emulator now refuses such an input as the firmware does.
 ## Platforms
 
 - **macOS:** IOKit, through hidapi.
-- **Linux:** hidraw, through hidapi's pure-Rust backend, so no libudev. A user needs access to the
-  device node, for instance with a udev rule:
-  `SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="21f7", TAG+="uaccess"`.
+- **Linux:** hidraw, through hidapi's pure-Rust backend, so no libudev. The device node is
+  root-only until a udev rule gives it to the logged-in user: `linux/70-keycard-shell.rules`
+  (`uaccess`, so it must sort before systemd's `73-seat-late.rules`).
 - **Windows:** hidapi's native backend, over `hid.dll`, which `nix-bundle-lgx`'s system-DLL list
   must allow before the portable package ships.
 
