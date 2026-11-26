@@ -407,11 +407,14 @@ impl Store {
         // only by a saved name — otherwise a locked wallet whose card was reset, which has only a
         // sealed doc, can never be removed.
         let has_doc = seed.is_some_and(|s| self.docs.seeds().iter().any(|x| x == s));
+        // A seed added while locked is listed by `closed()` too, so it can be forgotten as well.
+        let waiting = seed.is_some_and(|s| self.waiting.contains_key(s));
         let known = self.wallet_names.contains_key(id)
             || self.connections.contains_key(id)
             || self.aliases.contains_key(id)
             || self.offered.iter().any(|o| wallet_id(o) == id)
-            || has_doc;
+            || has_doc
+            || waiting;
         if !known {
             return Err(std::io::Error::other("Unknown wallet"));
         }
@@ -420,16 +423,21 @@ impl Store {
         self.wallet_names.remove(id);
         self.aliases.remove(id);
         self.connections.remove(id);
-        // `save()` only drops *readable* documents, so a sealed (locked) wallet's document must be
-        // removed explicitly here, or it re-appears from `closed()`.
-        if has_doc {
-            if let Some(s) = seed {
-                self.docs.remove(s).map_err(io)?;
-            }
-        }
         if let Err(e) = self.save() {
             self.restore(previous);
             return Err(e);
+        }
+        // `save()` only drops *readable* documents, so a sealed (locked) wallet's document must be
+        // removed explicitly, or it re-appears from `closed()`. Last, after the save, so a failure
+        // here can roll everything back: restore the rest and write it again.
+        if has_doc {
+            if let Some(s) = seed {
+                if let Err(e) = self.docs.remove(s) {
+                    self.restore(previous);
+                    let _ = self.save();
+                    return Err(io(e));
+                }
+            }
         }
         if let Some(seed) = seed {
             self.waiting.remove(seed);

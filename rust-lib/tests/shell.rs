@@ -805,6 +805,41 @@ fn a_seed_wallet_forgotten_here_is_forgotten_in_the_manager() {
 }
 
 #[test]
+fn a_locked_wallet_known_only_by_its_sealed_document_can_be_forgotten() {
+    let dir = scratch("forget-sealed");
+    let rig = rig_with(Store::open(&dir).unwrap());
+    add(&rig, vec![Family::Evm], Chain::Main);
+    unlock_all(&rig);
+    let id = rig.shell.wallet_groups()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let root = id.strip_prefix("seed:").unwrap().to_owned();
+    drop(rig);
+    // Reopened and not unlocked: the store holds nothing of it but the sealed document.
+    let reopened = Store::open(&dir).unwrap();
+    assert_eq!(
+        reopened
+            .closed()
+            .iter()
+            .map(|(s, _)| s.clone())
+            .collect::<Vec<_>>(),
+        vec![root.clone()]
+    );
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let rig = rig_events(reopened, Box::new(Forgot(told.clone())));
+    rig.shell.forget_wallet(&id).unwrap();
+    // The seed goes to the manager, and the wallet is gone here, for good.
+    assert_eq!(*told.lock().unwrap(), vec![root.clone()]);
+    assert!(rig.shell.closed_seeds().iter().all(|(s, _)| *s != root));
+    drop(rig);
+    let again = Store::open(&dir).unwrap();
+    assert!(again.closed().is_empty(), "still gone after reopening");
+    assert!(!again.knows(&root));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn stale_wallets_are_the_held_ones_the_store_no_longer_has() {
     let dir = scratch("stale");
     let rig = rig_with(Store::open(&dir).unwrap());
