@@ -136,7 +136,7 @@ request waits until it has.
 
 | The Shell answers | The job |
 |---|---|
-| `0x6982`, declined on the Shell | `refused` |
+| `0x6982`, declined on the Shell, or the Shell wasn't on its main screen | `refused`, saying both: the firmware cancels a request it can't show with this same word, at once, so the message says to go to its main screen and try again |
 | `0x6a80` to a PSBT | `refused`: the firmware answers this both when its person declines and when it can't sign, and its screen says which |
 | `0x6a80` to anything else | `invalid` |
 | `0x6985`, such as no card or a locked one; or no link | `unavailable` |

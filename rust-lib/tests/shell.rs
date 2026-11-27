@@ -314,6 +314,13 @@ fn a_refusal_on_the_shell_is_a_refused_job() {
         .unwrap();
     let st = settle(&mut rig, &job, false);
     assert_eq!(st.state, JobState::Refused, "{st:?}");
+    // 0x6982 is also the firmware's answer when it isn't on a screen that takes requests: the
+    // message names both, so a person who saw nothing on the Shell knows what to do.
+    let why = st.error.clone().unwrap().message;
+    assert!(
+        why.contains("declined") && why.contains("main screen"),
+        "{why}"
+    );
     let base = accounts[1].path.clone().unwrap();
     let (psbt, _) = conformance::psbt_for(
         &accounts[1],
