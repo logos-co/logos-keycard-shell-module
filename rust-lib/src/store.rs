@@ -401,7 +401,21 @@ impl Store {
     /// Forget a wallet here. Its seed, when it was a seed's and nothing of it is left: to forget in
     /// the signer manager.
     pub fn forget_wallet(&mut self, id: &str) -> std::io::Result<Option<String>> {
-        if !self.wallet_names.contains_key(id) {
+        let seed = id.strip_prefix("seed:");
+        // A wallet shows from any of: a saved name, a connection/alias, an offered account, or a
+        // sealed-but-locked document (see `closed()`). Forget it if it is known by ANY of these, not
+        // only by a saved name — otherwise a locked wallet whose card was reset, which has only a
+        // sealed doc, can never be removed.
+        let has_doc = seed.is_some_and(|s| self.docs.seeds().iter().any(|x| x == s));
+        // A seed added while locked is listed by `closed()` too, so it can be forgotten as well.
+        let waiting = seed.is_some_and(|s| self.waiting.contains_key(s));
+        let known = self.wallet_names.contains_key(id)
+            || self.connections.contains_key(id)
+            || self.aliases.contains_key(id)
+            || self.offered.iter().any(|o| wallet_id(o) == id)
+            || has_doc
+            || waiting;
+        if !known {
             return Err(std::io::Error::other("Unknown wallet"));
         }
         let previous = self.snapshot();
@@ -413,7 +427,18 @@ impl Store {
             self.restore(previous);
             return Err(e);
         }
-        let seed = id.strip_prefix("seed:");
+        // `save()` only drops *readable* documents, so a sealed (locked) wallet's document must be
+        // removed explicitly, or it re-appears from `closed()`. Last, after the save, so a failure
+        // here can roll everything back: restore the rest and write it again.
+        if has_doc {
+            if let Some(s) = seed {
+                if let Err(e) = self.docs.remove(s) {
+                    self.restore(previous);
+                    let _ = self.save();
+                    return Err(io(e));
+                }
+            }
+        }
         if let Some(seed) = seed {
             self.waiting.remove(seed);
         }

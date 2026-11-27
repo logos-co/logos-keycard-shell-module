@@ -93,6 +93,11 @@ app, with the public key at `m/1280263247'/n'`, which every holder of the seed g
     goes too.
   - Only a store read from an earlier run's `accounts.sealed.json` counts. One that failed to load,
     or found no file, forgets nothing.
+  - `forget_wallet` recognises a wallet by **any** of a saved name, a connection, an alias, an
+    offered account, or a **sealed (locked) document** — not only by a saved name. It removes that
+    sealed document explicitly, because `save()` drops only *readable* documents; otherwise a locked
+    wallet whose card was reset or lost (known here solely by its sealed document) re-appears from
+    `closed()` and can never be removed.
 - **`unlock_key`** (`{ seed, index }`, the manager alone) returns a job in `confirm_on_device`.
   - It runs on a connected Shell whose verified root is that seed, and exports the key at
     `m/1280263247'/<index>'` once its person confirms.
